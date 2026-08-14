@@ -373,10 +373,18 @@ class EplbState:
         max_slots_per_logical_expert = MAX_EXPERT_REDUNDANCY + 1
 
         init_path = self.parallel_config.eplb_config.init_placement_path
+        # A checkpoint says where the experts should *end up*, not where they
+        # are.  The loader has just filled every slot according to the trivial
+        # layout, so the live maps must start trivial and the weights have to be
+        # physically moved -- see `_install_initial_placement` below.  Installing
+        # the checkpoint's map here instead would leave every slot claiming an
+        # expert it does not hold: throughput is unaffected and every output is
+        # silently wrong, which is exactly the failure a throughput benchmark
+        # cannot see.
+        pending_init_p2l: torch.Tensor | None = None
         if init_path:
             # Saved as [num_moe_layers, num_physical_experts] -- each layer has
-            # its own optimised placement.  Derive logical maps from the full
-            # per-layer tensor via compute_logical_maps (CPU, then move to GPU).
+            # its own optimised placement.
             p2l_full = torch.load(init_path, map_location="cpu",
                                   weights_only=True).long()
             assert p2l_full.shape == (
@@ -385,67 +393,59 @@ class EplbState:
                 f"Placement checkpoint shape {tuple(p2l_full.shape)} does not "
                 f"match model ({model.num_moe_layers}, {model.num_physical_experts})"
             )
-            l2p_cpu, lr_cpu = compute_logical_maps(
-                p2l_full, model.num_logical_experts
-            )
-            # Pad l2p to max_slots_per_logical_expert
-            num_layers, nl, cur_slots = l2p_cpu.shape
-            padded = torch.full(
-                (num_layers, nl, max_slots_per_logical_expert), -1
-            )
-            padded[:, :, :cur_slots] = l2p_cpu
-            physical_to_logical_map = p2l_full.to(self.device)
-            logical_to_physical_map = padded.to(self.device)
-            logical_replica_count = lr_cpu.to(self.device)
+            # Left on CPU: this takes the same path as a periodic
+            # rearrangement, where the target comes straight from
+            # `policy.rebalance_experts` and `compute_logical_maps` asserts CPU.
+            pending_init_p2l = p2l_full
             logger.info(
-                "EPLB: loaded per-layer placement from %s "
-                "(layers=%d, num_physical=%d)",
+                "EPLB: loaded per-layer placement from %s (layers=%d, "
+                "num_physical=%d); experts will be rearranged to match it",
                 init_path,
                 model.num_moe_layers,
                 model.num_physical_experts,
             )
-        else:
-            physical_to_logical_map_list = (
-                EplbState.build_initial_global_physical_to_logical_map(
-                    model.num_routed_experts,
-                    model.num_redundant_experts,
-                )
-            )
-            p2l_1d = torch.tensor(
-                physical_to_logical_map_list,
-                device=self.device,
-            )
-            logical_to_physical_map = torch.full(
-                (model.num_logical_experts, max_slots_per_logical_expert),
-                -1,
-                device=self.device,
-            )
-            logical_replica_count = torch.zeros(
-                (model.num_logical_experts,),
-                device=self.device,
-                dtype=torch.long,
-            )
-            for i in range(model.num_physical_experts):
-                logical_idx = p2l_1d[i]
-                logical_to_physical_map[
-                    logical_idx, logical_replica_count[logical_idx]
-                ] = i
-                logical_replica_count[logical_idx] += 1
 
-            # Duplicate initial mapping for all layers
-            physical_to_logical_map = (
-                p2l_1d.unsqueeze(0).expand(model.num_moe_layers, -1).contiguous()
+        physical_to_logical_map_list = (
+            EplbState.build_initial_global_physical_to_logical_map(
+                model.num_routed_experts,
+                model.num_redundant_experts,
             )
-            logical_to_physical_map = (
-                logical_to_physical_map.unsqueeze(0)
-                .expand(model.num_moe_layers, -1, -1)
-                .contiguous()
-            )
-            logical_replica_count = (
-                logical_replica_count.unsqueeze(0)
-                .expand(model.num_moe_layers, -1)
-                .contiguous()
-            )
+        )
+        p2l_1d = torch.tensor(
+            physical_to_logical_map_list,
+            device=self.device,
+        )
+        logical_to_physical_map = torch.full(
+            (model.num_logical_experts, max_slots_per_logical_expert),
+            -1,
+            device=self.device,
+        )
+        logical_replica_count = torch.zeros(
+            (model.num_logical_experts,),
+            device=self.device,
+            dtype=torch.long,
+        )
+        for i in range(model.num_physical_experts):
+            logical_idx = p2l_1d[i]
+            logical_to_physical_map[
+                logical_idx, logical_replica_count[logical_idx]
+            ] = i
+            logical_replica_count[logical_idx] += 1
+
+        # Duplicate initial mapping for all layers
+        physical_to_logical_map = (
+            p2l_1d.unsqueeze(0).expand(model.num_moe_layers, -1).contiguous()
+        )
+        logical_to_physical_map = (
+            logical_to_physical_map.unsqueeze(0)
+            .expand(model.num_moe_layers, -1, -1)
+            .contiguous()
+        )
+        logical_replica_count = (
+            logical_replica_count.unsqueeze(0)
+            .expand(model.num_moe_layers, -1)
+            .contiguous()
+        )
 
         expert_load_pass = torch.zeros(
             (model.num_moe_layers, model.num_physical_experts),
@@ -517,6 +517,12 @@ class EplbState:
         self.model_states[model_config.compute_hash()] = model_state
         self.num_valid_physical_experts = model.num_physical_experts
 
+        # Move the experts to where the checkpoint says they belong.  This has
+        # to happen before the routing policy is told about the placement, so
+        # that what it is told is what is actually on the device.
+        if pending_init_p2l is not None:
+            self._install_initial_placement(model_state, pending_init_p2l)
+
         # Optional: hand L2 replica choice to the MoE Load Balancer.  A no-op
         # unless VLLM_MLB_L2_ALGORITHM is set, in which case vLLM's fused
         # mapping kernel is bypassed at the routing boundary.
@@ -556,6 +562,46 @@ class EplbState:
                 # committed update"; weights are loaded by this point, so this
                 # is the first half.
                 routing.announce_initial_placement()
+
+    def _install_initial_placement(
+        self,
+        model_state: EplbModelState,
+        target_physical_to_logical_map: torch.Tensor,
+    ) -> None:
+        """Rearrange the freshly loaded weights into a checkpointed placement.
+
+        The weights sit in the trivial layout after loading, so a checkpoint can
+        only be honoured by physically moving them; writing its map into the
+        live state without the move makes every slot claim an expert it does not
+        hold. That is invisible to a throughput benchmark -- the run is exactly
+        as fast, only the text is wrong -- so it is done here rather than being
+        left to the periodic rearrangement, which `step_interval` may disable.
+
+        Args:
+            model_state: The model whose experts should be moved.
+            target_physical_to_logical_map: ``[num_moe_layers,
+                num_physical_experts]`` placement the weights must end up in.
+        """
+        ep_group = get_ep_group().device_group
+        rearrange_expert_weights_inplace(
+            model_state.physical_to_logical_map,
+            target_physical_to_logical_map,
+            model_state.model.expert_weights,
+            model_state.expert_buffer,
+            ep_group,
+            model_state.communicator,
+            False,
+            None,
+        )
+        _commit_eplb_maps(
+            model_state,
+            new_physical_to_logical_map=target_physical_to_logical_map,
+        )
+        logger.info(
+            "EPLB: rearranged experts into the checkpointed placement "
+            "(%d layers)",
+            target_physical_to_logical_map.shape[0],
+        )
 
     def prepare_forward(
         self,

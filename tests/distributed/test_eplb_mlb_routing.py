@@ -193,6 +193,36 @@ def test_capabilities_gate_the_work_the_framework_does():
     assert st._default_replicas is not None
 
 
+def test_replica_routing_sees_every_replica_not_just_the_local_one():
+    """A replica-routing policy must be shown the whole candidate list.
+
+    Narrowing each expert to its local replica is what a rank-dispatch policy
+    asks for; handing the same view to LPLB decides in advance the very thing
+    LPLB is there to decide, and on a rank that holds a copy of everything it
+    sees it removes the redundancy entirely, so the LP is skipped. It also
+    keeps the returned shares indexable by vLLM's own map, since
+    ``replica_shares`` passes on the probabilities without the candidates.
+    """
+    rt = _runtime("lplb")
+    assert not rt.requires_rank_dispatch_map
+    snapshot = rt._snapshot(_layer_state(rt), 0)
+    assert torch.equal(
+        snapshot.logical_to_physical_candidates, rt._logical_to_physical_map[0]
+    ), "LPLB was handed a narrowed candidate list"
+    assert torch.equal(
+        snapshot.logical_to_physical_count, rt._logical_replica_count[0]
+    )
+    # The first 8 logical experts are replicated by _placement(); the choice
+    # between their copies is exactly what the policy has to solve.
+    assert int(snapshot.logical_to_physical_count[0]) == 2
+
+    # `static` is the policy the collapse exists for, and it still gets it.
+    st = _runtime("static")
+    assert st.requires_rank_dispatch_map
+    st_snapshot = st._snapshot(_layer_state(st), 0)
+    assert int(st_snapshot.logical_to_physical_count[0]) == 1
+
+
 def test_commit_is_skipped_for_policies_without_placement_state(monkeypatch):
     rt = _runtime("dynamic")
     calls = []
@@ -220,6 +250,41 @@ def test_only_changed_layers_are_refreshed(monkeypatch):
     seen.clear()
     rt.on_placement_committed(None)  # unknown -> conservative full refresh
     assert seen == [list(range(NUM_LAYERS))]
+
+
+def test_graphs_plus_rearranging_placement_state_is_refused(monkeypatch):
+    """LPLB replaces its solver tensors when a committed placement changes
+    their layout, and a captured CUDA graph cannot follow that -- replay reads
+    freed memory, observed as Xid 43 on two devices. It is intermittent (it
+    needs a rearrangement that actually changes the layout), so it has to be
+    refused up front rather than left to surface in a long serving run."""
+    import sys
+    import types
+
+    from vllm.distributed.eplb import mlb_runtime
+
+    class _Mode:
+        name = "FULL_AND_PIECEWISE"
+
+    class _Compilation:
+        cudagraph_mode = _Mode()
+
+    class _Cfg:
+        compilation_config = _Compilation()
+
+    stub = types.ModuleType("vllm.config")
+    stub.get_current_vllm_config = lambda: _Cfg()
+    monkeypatch.setitem(sys.modules, "vllm.config", stub)
+
+    with pytest.raises(ValueError, match="freed memory|Xid 43"):
+        mlb_runtime._reject_graphs_with_rearranging_placement_state(rearranges=True)
+
+    # Pinned placement is the supported combination and must stay allowed --
+    # that is how the reported LPLB numbers were measured.
+    mlb_runtime._reject_graphs_with_rearranging_placement_state(rearranges=False)
+
+    _Mode.name = "NONE"  # eager is the other escape
+    mlb_runtime._reject_graphs_with_rearranging_placement_state(rearranges=True)
 
 
 def test_initial_placement_is_announced():

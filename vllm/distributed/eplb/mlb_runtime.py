@@ -129,6 +129,9 @@ class MlbRoutingRuntime:
         # layer state so that MixtureOfExperts.set_eplb_state -- a public model
         # interface -- does not have to change.
         self.physical_to_logical_map = physical_to_logical_map
+        # A logical expert can hold at most one slot plus every redundant one,
+        # so this bounds the replica count without reading the map off device.
+        self._max_replicas = num_physical_experts - num_logical_experts + 1
         self._default_replicas: torch.Tensor | None = None
         # [num_physical_experts] — slot i belongs to rank (i // experts_per_rank).
         # Passed to every PlacementSnapshot so LPLB can incorporate cross-GPU
@@ -239,17 +242,40 @@ class MlbRoutingRuntime:
             to_placement_snapshot,
         )
 
-        # Collapse the global all-replicas list to nearest-local-replica,
-        # matching SGLang's _compute_logical_to_all_physical_map behaviour.
-        # Experts with a local copy get a single-entry list (always route
-        # locally); only experts without a local copy need real LP decisions.
-        # This reduces LP problem size and avoids unnecessary cross-GPU dispatch.
-        collapsed_candidates, collapsed_counts = collapse_candidates_to_local(
-            layer_state.logical_to_physical_map,
-            layer_state.logical_replica_count,
-            ep_rank=self.ep_rank,
-            num_local_physical_experts=self.num_physical_experts // self.ep_size,
-        )
+        # Narrowing an expert's candidates to its local replica is a *routing
+        # decision* ("never pay for a cross-GPU hop"), not a view of the
+        # placement, so it belongs to the policy that asked for it rather than
+        # to every policy.  SGLang draws the line the same way: the collapse
+        # lives in `logical_to_rank_dispatch_physical_map`, which it only builds
+        # when the pipeline reports `requires_rank_dispatch_map` -- while
+        # `init_by_eplb`, the path taken on every rebalance, hands the policy
+        # the full global list.
+        #
+        # Applying it unconditionally answers the question LPLB exists to ask:
+        # with a local replica always winning, a rank holding a copy has nothing
+        # left to solve, so the LP is skipped outright and the rest see only the
+        # experts they do not host.  It also keeps the shares MLB returns
+        # indexable by vLLM's own `logical_to_physical_map` -- `replica_shares`
+        # passes on the probabilities alone, and their columns line up with that
+        # map only because the candidates handed to MLB are that map.
+        # vLLM pads the candidate map to MAX_EXPERT_REDUNDANCY + 1 (1024)
+        # columns whatever the configured redundancy, and MLB answers with a
+        # table the same width as the candidates it was given. The kernel scans
+        # that table with a compile-time loop, so handing over the padded width
+        # is what made the share-table branch impossible to compile. Every
+        # column past `_max_replicas` is padding on both sides, so trimming to
+        # it changes no decision.
+        candidates = layer_state.logical_to_physical_map[:, : self._max_replicas]
+        counts = layer_state.logical_replica_count
+        if self.requires_rank_dispatch_map:
+            candidates, counts = collapse_candidates_to_local(
+                candidates,
+                counts,
+                ep_rank=self.ep_rank,
+                num_local_physical_experts=(
+                    self.num_physical_experts // self.ep_size
+                ),
+            )
 
         defaults = self._default_replicas
         return to_placement_snapshot(
@@ -259,8 +285,8 @@ class MlbRoutingRuntime:
             num_logical_experts=self.num_logical_experts,
             num_physical_experts=self.num_physical_experts,
             ep_size=self.ep_size,
-            candidates=collapsed_candidates,
-            counts=collapsed_counts,
+            candidates=candidates,
+            counts=counts,
             default_physical_for_logical=(
                 None if defaults is None else defaults[layer_id]
             ),
@@ -337,9 +363,15 @@ class MlbRoutingRuntime:
                         self.num_physical_experts // self.ep_size
                     ),
                     physical_to_logical_map=self.physical_to_logical_map[layer_id],
+                    # Same trim as `_snapshot`, and it has to be the same: the
+                    # policy sizes its per-layer state from whichever snapshot
+                    # reaches it first, and this one does -- it runs for every
+                    # layer at startup. Committing the padded width here left
+                    # the solver emitting 1024-wide tables that the mapping
+                    # kernel then could not compile.
                     logical_to_physical_candidates=self._logical_to_physical_map[
                         layer_id
-                    ],
+                    ][:, : self._max_replicas],
                     logical_to_physical_count=self._logical_replica_count[layer_id],
                     default_physical_for_logical=(
                         None

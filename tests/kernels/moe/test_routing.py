@@ -10,6 +10,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import (
+    _eplb_map_and_record_triton,
     eplb_map_to_physical_and_record,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -775,6 +776,71 @@ def test_eplb_map_no_redundancy(
         torch.testing.assert_close(load, exp_load)
     else:
         assert load.sum().item() == 0
+
+
+def test_eplb_replica_shares_steer_routing_from_a_narrow_table():
+    """A supplied share table decides the replica, and it may be narrower than
+    the candidate map.
+
+    vLLM pads the map to ``MAX_EXPERT_REDUNDANCY + 1`` (1024) columns whatever
+    the redundancy, and the table is walked by a compile-time loop, so a table
+    as wide as the map cannot be compiled in reasonable time. Only the width
+    that can hold real replicas is needed, and the map is still indexed at its
+    own width.
+    """
+    num_tokens, num_logical, R = 4096, 8, 2
+    map_slots = 64  # padding, as vLLM does (it uses 1024)
+    num_physical = num_logical + R - 1
+
+    l2p = torch.full((num_logical, map_slots), -1, dtype=torch.int64, device="cuda")
+    l2p[0, :R] = torch.arange(R, dtype=torch.int64, device="cuda")
+    for i in range(1, num_logical):
+        l2p[i, 0] = R + i - 1
+    rc = torch.tensor([R] + [1] * (num_logical - 1), dtype=torch.int64, device="cuda")
+
+    torch.manual_seed(0)
+    topk_ids = torch.randint(
+        1, num_logical, (num_tokens, 2), dtype=torch.int32, device="cuda"
+    )
+    topk_ids[:, 0] = 0  # every token hits the replicated expert
+    rec = torch.tensor(True, dtype=torch.bool, device="cuda")
+
+    for target in range(R):
+        prob = torch.zeros((num_logical, R), dtype=torch.float32, device="cuda")
+        prob[0, target] = 1.0  # send expert 0's traffic to exactly one replica
+        load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+        _eplb_map_and_record_triton(
+            topk_ids=topk_ids,
+            logical_to_physical_map=l2p,
+            logical_replica_count=rc,
+            expert_load_view=load,
+            record_enabled=rec,
+            num_unpadded_tokens=None,
+            replica_prob=prob,
+        )
+        hot = load[:R]
+        assert int(hot[target]) == num_tokens, (
+            f"share table asked for replica {target}, got {hot.tolist()}"
+        )
+        assert int(hot.sum()) == num_tokens
+
+    # An all-zero row means "no preference" and must fall back to the hash,
+    # not collapse every token onto replica 0.
+    prob = torch.zeros((num_logical, R), dtype=torch.float32, device="cuda")
+    load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+    _eplb_map_and_record_triton(
+        topk_ids=topk_ids,
+        logical_to_physical_map=l2p,
+        logical_replica_count=rc,
+        expert_load_view=load,
+        record_enabled=rec,
+        num_unpadded_tokens=None,
+        replica_prob=prob,
+    )
+    hot = load[:R].float()
+    assert (hot.max() / hot.mean()).item() < 1.15, (
+        f"all-zero row did not fall back to the hash: {hot.tolist()}"
+    )
 
 
 @pytest.mark.parametrize("top_k,R", [(2, 2), (4, 2), (8, 4), (8, 8)])

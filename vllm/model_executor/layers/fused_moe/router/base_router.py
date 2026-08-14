@@ -6,12 +6,15 @@ from collections.abc import Callable
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+logger = init_logger(__name__)
 
 if current_platform.is_cuda_alike():
 
@@ -32,7 +35,7 @@ if current_platform.is_cuda_alike():
         num_active_experts,
         HAS_NUM_UNPADDED: tl.constexpr,
         HAS_REPLICA_PROB: tl.constexpr,
-        MAP_SLOTS: tl.constexpr,
+        PROB_SLOTS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -63,9 +66,9 @@ if current_platform.is_cuda_alike():
             # choice stays a pure function of the token index: every rank
             # computes the same replica for the same token without exchanging
             # anything, and no RNG state enters the CUDA graph.
-            row = safe_expert_id * MAP_SLOTS
+            row = safe_expert_id * PROB_SLOTS
             total = tl.zeros_like(hashed).to(tl.float32)
-            for j in tl.static_range(MAP_SLOTS):
+            for j in tl.static_range(PROB_SLOTS):
                 total += tl.load(
                     replica_prob_ptr + row + j, mask=mask & valid_expert, other=0.0
                 )
@@ -73,7 +76,7 @@ if current_platform.is_cuda_alike():
             draw = (hashed.to(tl.float32) / 4294967296.0) * total
             acc = tl.zeros_like(total)
             sampled = tl.zeros_like(replica_idx)
-            for j in tl.static_range(MAP_SLOTS):
+            for j in tl.static_range(PROB_SLOTS):
                 acc += tl.load(
                     replica_prob_ptr + row + j, mask=mask & valid_expert, other=0.0
                 )
@@ -141,11 +144,28 @@ if current_platform.is_cuda_alike():
         grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
         assert expert_load_view.is_contiguous()
         map_slots = logical_to_physical_map.shape[1]
+        # The share table is scanned with a compile-time loop, so its width has
+        # to be the number of replicas that can exist -- not the width of the
+        # candidate map, which is padded to MAX_EXPERT_REDUNDANCY + 1 (1024)
+        # however few redundant experts are configured. Unrolling that twice is
+        # 2048 loads per element and takes Triton well past vLLM's RPC timeout
+        # to compile. A narrower table is a prefix of the same columns, so a
+        # sampled index still resolves against the full-width map below.
+        prob_slots = map_slots
         if replica_prob is not None:
-            assert replica_prob.shape == logical_to_physical_map.shape, (
-                "replica shares must share the candidate map's layout: "
+            assert (
+                replica_prob.shape[0] == logical_to_physical_map.shape[0]
+                and replica_prob.shape[1] <= map_slots
+            ), (
+                "replica shares must be a column prefix of the candidate map: "
                 f"{tuple(replica_prob.shape)} vs "
                 f"{tuple(logical_to_physical_map.shape)}"
+            )
+            prob_slots = replica_prob.shape[1]
+            logger.info_once(
+                "MLB replica-share routing active: table width %d, map width %d",
+                prob_slots,
+                map_slots,
             )
             replica_prob = replica_prob.contiguous().to(torch.float32)
         _eplb_map_and_record_i32_kernel[grid](
@@ -164,7 +184,7 @@ if current_platform.is_cuda_alike():
             num_active_experts,
             HAS_NUM_UNPADDED=num_unpadded_tokens is not None,
             HAS_REPLICA_PROB=replica_prob is not None,
-            MAP_SLOTS=map_slots,
+            PROB_SLOTS=prob_slots,
             BLOCK_SIZE=256,
         )
         return out_flat.reshape(topk_ids.shape)
