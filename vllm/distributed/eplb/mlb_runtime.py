@@ -130,6 +130,15 @@ class MlbRoutingRuntime:
         # interface -- does not have to change.
         self.physical_to_logical_map = physical_to_logical_map
         self._default_replicas: torch.Tensor | None = None
+        # [num_physical_experts] — slot i belongs to rank (i // experts_per_rank).
+        # Passed to every PlacementSnapshot so LPLB can incorporate cross-GPU
+        # transfer cost; SGLang always provides this, we build it from topology.
+        from moe_load_balancer.adapters.vllm import build_physical_to_rank_map
+        self._physical_to_rank_map = build_physical_to_rank_map(
+            num_physical_experts,
+            ep_size,
+            device=physical_to_logical_map.device,
+        )
         self._mlb = MoELoadBalancer.from_algorithm(
             algorithm,
             ep_size=ep_size,
@@ -163,7 +172,22 @@ class MlbRoutingRuntime:
         self.physical_to_logical_map = mapping
 
     def _snapshot(self, layer_state: EplbLayerState, layer_id: int) -> Any:
-        from moe_load_balancer.adapters.vllm import to_placement_snapshot
+        from moe_load_balancer.adapters.vllm import (
+            collapse_candidates_to_local,
+            to_placement_snapshot,
+        )
+
+        # Collapse the global all-replicas list to nearest-local-replica,
+        # matching SGLang's _compute_logical_to_all_physical_map behaviour.
+        # Experts with a local copy get a single-entry list (always route
+        # locally); only experts without a local copy need real LP decisions.
+        # This reduces LP problem size and avoids unnecessary cross-GPU dispatch.
+        collapsed_candidates, collapsed_counts = collapse_candidates_to_local(
+            layer_state.logical_to_physical_map,
+            layer_state.logical_replica_count,
+            ep_rank=self.ep_rank,
+            num_local_physical_experts=self.num_physical_experts // self.ep_size,
+        )
 
         defaults = self._default_replicas
         return to_placement_snapshot(
@@ -173,9 +197,12 @@ class MlbRoutingRuntime:
             num_logical_experts=self.num_logical_experts,
             num_physical_experts=self.num_physical_experts,
             ep_size=self.ep_size,
+            candidates=collapsed_candidates,
+            counts=collapsed_counts,
             default_physical_for_logical=(
                 None if defaults is None else defaults[layer_id]
             ),
+            physical_to_rank_map=self._physical_to_rank_map,
         )
 
     def _rebuild_default_replicas(self) -> None:
@@ -348,6 +375,48 @@ class MlbRoutingRuntime:
         return selection.probability
 
 
+def _reject_graphs_with_rearranging_placement_state(rearranges: bool) -> None:
+    """Refuse the one combination that can fault the GPU.
+
+    A policy that keeps per-layer state rebuilds it when a committed placement
+    changes that state's layout, and LPLB *replaces* the tensors in that case
+    rather than updating them in place -- its own ``prepare_layer`` docstring
+    notes that keeping a previously captured graph valid across such a change
+    "requires a future fixed-shape LPLB state representation".
+
+    A CUDA graph captures pointers. Once the solver's buffers move, replaying
+    the graph reads freed memory: observed as ``Xid 43`` on two devices and a
+    dead worker. It is intermittent -- it needs a rearrangement that actually
+    changes the layout, so a short benchmark can pass and a long serving run
+    can fault. That is worth failing loudly for.
+
+    Both escapes keep MLB routing available: pin the placement (leave
+    rearrangement off, which is how the reported LPLB numbers were measured),
+    or run eager.
+    """
+    if not rearranges:
+        return
+    from vllm.config import get_current_vllm_config
+
+    try:
+        compilation = get_current_vllm_config().compilation_config
+    except Exception:  # noqa: BLE001 - no config context: leave the decision alone
+        return
+    if getattr(compilation, "cudagraph_mode", None) is None:
+        return
+    if compilation.cudagraph_mode.name == "NONE":
+        return
+    raise ValueError(
+        "VLLM_MLB_L2_ALGORITHM keeps per-layer solver state, and EPLB "
+        "rearrangement can change that state's layout. LPLB replaces its "
+        "tensors on such a change, which a captured CUDA graph cannot follow "
+        "-- replay then reads freed memory (Xid 43). Either disable "
+        "rearrangement (eplb_config step_interval high, or policy that does "
+        "not re-plan), or set enforce_eager=True. Fixing this properly needs "
+        "a fixed-shape solver state in moe_load_balancer."
+    )
+
+
 def init_mlb_routing(
     *,
     ep_size: int,
@@ -357,6 +426,7 @@ def init_mlb_routing(
     physical_to_logical_map: torch.Tensor,
     logical_to_physical_map: torch.Tensor,
     logical_replica_count: torch.Tensor,
+    rearranges: bool = False,
 ) -> MlbRoutingRuntime | None:
     """Create the routing runtime if ``VLLM_MLB_L2_ALGORITHM`` is set."""
     global _runtime
@@ -372,6 +442,8 @@ def init_mlb_routing(
         physical_to_logical_map=physical_to_logical_map,
     )
     _runtime.register_logical_maps(logical_to_physical_map, logical_replica_count)
+    if _runtime.requires_placement_state:
+        _reject_graphs_with_rearranging_placement_state(rearranges)
     return _runtime
 
 
