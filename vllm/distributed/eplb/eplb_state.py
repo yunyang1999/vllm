@@ -510,7 +510,7 @@ class EplbState:
                     "unset VLLM_MLB_L2_ALGORITHM."
                 )
             ep_group = get_ep_group()
-            init_mlb_routing(
+            routing = init_mlb_routing(
                 ep_size=ep_group.world_size,
                 ep_rank=ep_group.rank_in_group,
                 num_logical_experts=model.num_logical_experts,
@@ -519,6 +519,11 @@ class EplbState:
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
             )
+            if routing is not None:
+                # The contract is "after initial weight loading and after each
+                # committed update"; weights are loaded by this point, so this
+                # is the first half.
+                routing.announce_initial_placement()
 
     def prepare_forward(
         self,
@@ -911,6 +916,27 @@ class EplbState:
                         )
 
                 if not skip_rearrange:
+                    # Which layers actually move?  A pluggable routing policy
+                    # may have to rebuild per-layer state, which for `lplb`
+                    # costs a JIT build plus warmup; refreshing untouched
+                    # layers is pure stall.  SGLang gets this list from its own
+                    # updater (`update_layer_ids`); vLLM does not track it, so
+                    # diff here -- before `_commit_eplb_maps` overwrites the
+                    # live map in place, which would make every layer look
+                    # unchanged.
+                    changed_layer_ids = (
+                        (
+                            eplb_model_state.physical_to_logical_map
+                            != new_physical_to_logical_map.to(
+                                eplb_model_state.physical_to_logical_map.device
+                            )
+                        )
+                        .any(dim=-1)
+                        .nonzero()
+                        .flatten()
+                        .tolist()
+                    )
+
                     # Update expert weights
                     rearrange_expert_weights_inplace(
                         eplb_model_state.physical_to_logical_map,
@@ -935,7 +961,7 @@ class EplbState:
 
                         routing = get_mlb_routing()
                         if routing is not None:
-                            routing.on_placement_committed()
+                            routing.on_placement_committed(changed_layer_ids)
 
                 if is_main_rank:
                     assert start_event is not None

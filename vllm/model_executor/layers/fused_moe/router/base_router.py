@@ -146,7 +146,9 @@ if current_platform.is_cuda_alike():
             from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
 
             routing = get_mlb_routing()
-            if routing is not None:
+            # The policy itself declares whether it wants the routing boundary;
+            # a pipeline with no post-TopK stage leaves the fused kernel alone.
+            if routing is not None and routing.requires_post_topk_routing:
                 return routing.route(
                     topk_ids, topk_weights, layer_state, num_unpadded_tokens
                 )

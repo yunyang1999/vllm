@@ -72,6 +72,37 @@ class VllmRoutingCollectives:
         return get_ep_group().all_reduce(payload)
 
 
+def _current_stage() -> str | None:
+    """Map vLLM's current batch onto MLB's routing stage.
+
+    SGLang hands MLB a discrete ForwardMode (EXTEND / DECODE / IDLE / ...).
+    vLLM has no equivalent: with continuous batching and chunked prefill a
+    single batch routinely mixes prefill and decode tokens, so a clean
+    "prefill" stage does not exist.  Only decode is provable -- every request
+    contributing exactly one token -- and everything else is reported as mixed
+    rather than guessed at, so a stage-gated policy never runs on a stage it
+    did not ask for.
+    """
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    if not is_forward_context_available():
+        return None
+    descriptor = getattr(get_forward_context(), "batch_descriptor", None)
+    if descriptor is None:
+        return None
+    if (
+        descriptor.uniform
+        and descriptor.num_reqs is not None
+        and descriptor.num_reqs > 0
+        and descriptor.num_tokens == descriptor.num_reqs
+    ):
+        return "decode"
+    return "mixed"
+
+
 def _record_physical_load(
     physical_topk_ids: torch.Tensor,
     expert_load_view: torch.Tensor,
@@ -136,13 +167,26 @@ class MlbRoutingRuntime:
             experts_per_rank=num_physical_experts // ep_size,
             collectives=VllmRoutingCollectives(),
         )
+        # MLB declares what the framework has to prepare for the selected
+        # policy, so none of the work below is done unconditionally: `lplb`
+        # needs placement state refreshed on commit, `static` needs a per-rank
+        # dispatch table, and only a pipeline with a post-TopK policy wants the
+        # routing boundary at all.
+        caps = self._mlb.routing_capabilities
+        self.requires_post_topk_routing = caps.requires_post_topk_routing
+        self.requires_placement_state = caps.requires_placement_state
+        self.requires_rank_dispatch_map = caps.requires_rank_dispatch_map
         logger.info(
-            "MLB L2 routing enabled (algorithm=%s, ep_size=%d, "
-            "logical=%d, physical=%d)",
+            "MLB L2 routing enabled (algorithm=%s, ep_size=%d, logical=%d, "
+            "physical=%d, caps: post_topk=%s placement_state=%s "
+            "rank_dispatch_map=%s)",
             algorithm,
             ep_size,
             num_logical_experts,
             num_physical_experts,
+            self.requires_post_topk_routing,
+            self.requires_placement_state,
+            self.requires_rank_dispatch_map,
         )
 
     def set_physical_to_logical_map(self, mapping: torch.Tensor) -> None:
@@ -167,8 +211,14 @@ class MlbRoutingRuntime:
     def _rebuild_default_replicas(self) -> None:
         """Synthesize the per-rank default replica table vLLM does not keep.
 
-        Recomputed only when a placement is committed, never per forward.
+        Only `static` replica routing reads it (MLB reports that through
+        ``requires_rank_dispatch_map``), and it is recomputed only when a
+        placement is committed -- never per forward.
         """
+        if not self.requires_rank_dispatch_map:
+            self._default_replicas = None
+            return
+
         from moe_load_balancer.adapters.vllm import nearest_replica_table
 
         self._default_replicas = torch.stack(
@@ -198,43 +248,26 @@ class MlbRoutingRuntime:
         self._logical_replica_count = logical_replica_count
         self._rebuild_default_replicas()
 
-    def on_placement_committed(self) -> None:
-        """Rebuild placement-derived policy state after a committed rearrange.
+    def announce_initial_placement(self) -> None:
+        """Tell MLB about the placement the model just loaded with.
 
-        MLB does not track a placement version; it refreshes derived state only
-        at this explicit lifecycle event.  Must be called after vLLM has moved
-        weights and updated its live metadata -- never from an uncommitted plan.
+        The contract is "after initial weight loading **and** after each
+        committed update"; SGLang does the first half in
+        ``ModelRunner._prepare_moe_topk``.  Skipping it leaves a policy to build
+        its per-layer state lazily inside the first forward, from whatever
+        placement that forward happens to see.
         """
+        if not self.requires_placement_state:
+            return
+        num_layers = self._logical_to_physical_map.shape[0]
+        self._commit_layers(range(num_layers))
+        logger.info("MLB: announced initial placement for %d layers", num_layers)
+
+    def _commit_layers(self, layer_ids) -> None:
+        """Hand MLB the committed placement of the given layers."""
         from moe_load_balancer.core.types import PlacementSnapshot
 
-        # KNOWN ISSUE (measured 2026-08-11, DeepSeek-style MoE, TP2/EP2):
-        # with the `lplb` policy this hook kills the worker at the first
-        # rearrangement -- silently, with no Python traceback.  Steady-state
-        # lplb routing is fine: with rearrangement disabled the same build
-        # serves correctly, and with this hook skipped rearrangement also runs
-        # clean, so the fault is inside the per-layer rebuild below rather than
-        # in lplb's routing or in vLLM's weight movement.
-        #
-        # Ruled out by experiment: racing the `non_blocking=True` map commit (a
-        # full torch.cuda.synchronize() here does not help) and GPU memory
-        # pressure (unchanged at gpu_memory_utilization=0.55).  The leading
-        # remaining hypothesis is a candidate-table *width* change: vLLM pads
-        # `logical_to_physical_map` with `_pad_out_tensor`, so max-replicas can
-        # differ before and after a rearrangement, and LPLBL2Router.prepare_layer
-        # documents shape-changing updates as the path that replaces -- rather
-        # than updates in place -- its prepared state.
-        #
-        # Until that is fixed, `MLB_SKIP_COMMIT_HOOK=1` is the workaround: the
-        # policy then keeps serving from its initial placement state.  That is
-        # only correct while the placement it derived state from is still live,
-        # so it is a triage aid, not a supported configuration.
-        if os.environ.get("MLB_SKIP_COMMIT_HOOK") == "1":
-            logger.warning("MLB placement-commit hook skipped (MLB_SKIP_COMMIT_HOOK=1)")
-            return
-
-        self._rebuild_default_replicas()
-        num_layers = self._logical_to_physical_map.shape[0]
-        for layer_id in range(num_layers):
+        for layer_id in layer_ids:
             self._mlb.on_placement_committed(
                 PlacementSnapshot(
                     layer_id=layer_id,
@@ -249,8 +282,44 @@ class MlbRoutingRuntime:
                         layer_id
                     ],
                     logical_to_physical_count=self._logical_replica_count[layer_id],
+                    default_physical_for_logical=(
+                        None
+                        if self._default_replicas is None
+                        else self._default_replicas[layer_id]
+                    ),
                 )
             )
+
+    def on_placement_committed(
+        self, changed_layer_ids: list[int] | None = None
+    ) -> None:
+        """Refresh policy state for layers whose placement just changed.
+
+        Must be called after vLLM has moved weights and updated its live
+        metadata -- never from an uncommitted plan.
+
+        ``changed_layer_ids`` matters for cost, not just tidiness.  A policy
+        whose per-layer state layout changes has to rebuild it, and for `lplb`
+        that means a JIT build plus warmup -- about 14.5 s per layer measured
+        here.  Refreshing all 40 layers stalled the worker for ~102 s, long
+        enough for the peer's collective to time out and kill it.  SGLang
+        avoids this by passing the framework's own ``update_layer_ids``
+        (``ModelRunner._notify_mlb_placement_committed``); vLLM does not track
+        them, so Glue diffs the maps before committing and passes the result.
+        """
+        if not self.requires_placement_state:
+            return
+        self._rebuild_default_replicas()
+        if changed_layer_ids is None:
+            changed_layer_ids = list(range(self._logical_to_physical_map.shape[0]))
+        if not changed_layer_ids:
+            return
+        self._commit_layers(changed_layer_ids)
+        logger.info(
+            "MLB: refreshed placement state for %d/%d layers",
+            len(changed_layer_ids),
+            self._logical_to_physical_map.shape[0],
+        )
 
     def route(
         self,
@@ -258,8 +327,16 @@ class MlbRoutingRuntime:
         topk_weights: torch.Tensor,
         layer_state: EplbLayerState,
         num_unpadded_tokens: torch.Tensor | None,
+        routed_scaling_factor: float = 1.0,
     ) -> torch.Tensor:
-        """Return physical topk ids chosen by MLB, and record the load."""
+        """Return physical topk ids chosen by MLB, and record the load.
+
+        ``routed_scaling_factor`` is plumbed but left at its default: MLB only
+        reads it when materializing a shared-expert decision, and vLLM's CUDA
+        path has no shared-expert dispatch to materialize.  Threading the real
+        value down from the MoE layer would add invasiveness for a value
+        nothing on this path consumes.
+        """
         from moe_load_balancer.adapters.vllm import (
             to_routing_request,
             to_vllm_topk_ids,
@@ -278,7 +355,9 @@ class MlbRoutingRuntime:
                 logical_topk_ids=topk_ids,
                 topk_weights=topk_weights,
                 placement=self._snapshot(layer_state, layer_id),
+                stage=_current_stage(),
                 token_count=num_unpadded_tokens,
+                routed_scaling_factor=routed_scaling_factor,
             )
         )
         physical = to_vllm_topk_ids(decision)

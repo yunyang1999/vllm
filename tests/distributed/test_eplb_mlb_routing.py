@@ -224,3 +224,61 @@ def test_placement_commit_refreshes_policy_state():
     assert torch.equal(back, logical), (
         "routing broke after a committed placement change"
     )
+
+
+def test_capabilities_gate_the_work_the_framework_does():
+    """MLB declares what the framework must prepare; Glue must honour it
+    instead of doing every lifecycle step for every policy."""
+    dyn = _runtime("dynamic")
+    # dynamic keeps no placement-derived state and needs no dispatch table.
+    assert dyn.requires_post_topk_routing
+    assert not dyn.requires_placement_state
+    assert not dyn.requires_rank_dispatch_map
+    assert dyn._default_replicas is None, (
+        "the rank dispatch table was built for a policy that never reads it"
+    )
+
+    st = _runtime("static")
+    assert st.requires_rank_dispatch_map
+    assert st._default_replicas is not None
+
+
+def test_commit_is_skipped_for_policies_without_placement_state(monkeypatch):
+    rt = _runtime("dynamic")
+    calls = []
+    monkeypatch.setattr(rt, "_commit_layers", lambda ids: calls.append(list(ids)))
+    rt.on_placement_committed([0, 1])
+    rt.announce_initial_placement()
+    assert calls == [], "dynamic does not keep placement state; nothing to refresh"
+
+
+def test_only_changed_layers_are_refreshed(monkeypatch):
+    """Refreshing an untouched layer is pure stall: a shape-changing rebuild
+    costs a JIT build plus warmup per layer."""
+    rt = _runtime("static")  # any policy; we intercept the MLB call
+    seen = []
+    monkeypatch.setattr(rt, "requires_placement_state", True)
+    monkeypatch.setattr(rt, "_commit_layers", lambda ids: seen.append(list(ids)))
+
+    rt.on_placement_committed([1, 3])
+    assert seen == [[1, 3]]
+
+    seen.clear()
+    rt.on_placement_committed([])
+    assert seen == [], "an empty change set must not touch any layer"
+
+    seen.clear()
+    rt.on_placement_committed(None)  # unknown -> conservative full refresh
+    assert seen == [list(range(NUM_LAYERS))]
+
+
+def test_initial_placement_is_announced():
+    """The contract is 'after initial weight loading AND after each commit';
+    skipping the first half leaves the policy to build state lazily inside the
+    first forward, from whatever placement that forward happens to see."""
+    rt = _runtime("static")
+    seen = []
+    rt.requires_placement_state = True
+    rt._commit_layers = lambda ids: seen.append(list(ids))
+    rt.announce_initial_placement()
+    assert seen == [list(range(NUM_LAYERS))]
