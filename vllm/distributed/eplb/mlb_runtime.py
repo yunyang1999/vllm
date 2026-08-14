@@ -423,10 +423,12 @@ class MlbRoutingRuntime:
             )
 
         # Accumulate LOCAL count for this layer into the stable buffer.
-        # count_logical_experts is a CUDA kernel → captured in CUDA graphs.
-        # The all_reduce happens OUTSIDE the graph (in finalize_step_counts),
-        # so NCCL never touches the capture stream.
-        if self._lplb_local_count is not None:
+        # Skip during Dynamo tracing: count_logical_experts_cuda is a custom
+        # CUDA kernel that Dynamo may not handle.  During actual execution
+        # (graph capture or eager) it runs normally and is captured into the
+        # CUDA graph along with the copy_.  On replay, the captured kernels
+        # re-execute with fresh topk_ids and update _lplb_local_count.
+        if self._lplb_local_count is not None and not torch._dynamo.is_compiling():
             local = count_logical_experts(topk_ids, self.num_logical_experts)
             self._lplb_local_count[layer_id].copy_(local)
 
