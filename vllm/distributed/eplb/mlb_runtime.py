@@ -5,8 +5,10 @@
 vLLM's built-in replica choice is a Knuth hash of the token index, fused into
 the same Triton kernel that records expert load
 (``fused_moe/router/base_router.py``).  When an MLB routing algorithm is
-selected, that kernel is bypassed: MLB decides the physical replica and this
-module records the load separately.
+selected the kernel is kept: MLB supplies the per-expert replica shares it
+solved for, and the kernel samples from them instead of hashing.  Recording,
+the record gate and the padding mask therefore stay where vLLM put them, with
+nothing reimplemented alongside.
 
 Enable with ``VLLM_MLB_L2_ALGORITHM``, e.g. ``lplb``, ``dynamic``, ``static``.
 Unset (the default) leaves vLLM's fused kernel in charge, so this module costs
@@ -101,38 +103,6 @@ def _current_stage() -> str | None:
     ):
         return "decode"
     return "mixed"
-
-
-def _record_physical_load(
-    physical_topk_ids: torch.Tensor,
-    expert_load_view: torch.Tensor,
-    record_enabled: torch.Tensor,
-    num_unpadded_tokens: torch.Tensor | None,
-) -> None:
-    """Record per-physical-expert load for topk ids MLB already mapped.
-
-    Reproduces the second half of ``_eplb_map_and_record_i32_kernel``: physical
-    counting, the record gate, and the padding mask.  Everything stays on the
-    device and is expressed as tensor arithmetic, so it is CUDA-graph safe --
-    in particular ``record_enabled`` is folded in as a mask instead of being
-    branched on, which would force a host sync.
-    """
-    if expert_load_view is None:
-        return
-    num_active_experts = physical_topk_ids.shape[-1]
-    flat = physical_topk_ids.reshape(-1)
-    valid = flat >= 0
-    if num_unpadded_tokens is not None:
-        positions = torch.arange(flat.numel(), device=flat.device)
-        valid = valid & (
-            (positions // num_active_experts) < num_unpadded_tokens.reshape(())
-        )
-    valid = valid & (record_enabled.reshape(()) != 0)
-    expert_load_view.scatter_add_(
-        0,
-        flat.clamp(min=0).long(),
-        valid.to(expert_load_view.dtype),
-    )
 
 
 class MlbRoutingRuntime:
@@ -321,26 +291,34 @@ class MlbRoutingRuntime:
             self._logical_to_physical_map.shape[0],
         )
 
-    def route(
+    def replica_shares(
         self,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         layer_state: EplbLayerState,
         num_unpadded_tokens: torch.Tensor | None,
         routed_scaling_factor: float = 1.0,
-    ) -> torch.Tensor:
-        """Return physical topk ids chosen by MLB, and record the load.
+    ) -> torch.Tensor | None:
+        """Ask MLB how this layer's traffic should be split across replicas.
+
+        Returns a ``[num_logical, max_replicas]`` share table laid out like
+        vLLM's own ``logical_to_physical_map``, or None when the policy did not
+        produce one -- in which case the caller keeps its built-in choice.
+
+        The point of asking for the table rather than for per-token ids is that
+        vLLM fuses replica selection and expert-load recording into one kernel.
+        Taking over the ids means taking over the recording too, and
+        reimplementing the record gate, the padding mask and the physical
+        counting alongside a kernel that already does all three is duplication
+        that silently drifts. Handing back a table keeps every one of those in
+        vLLM's kernel, and MLB keeps the part that is genuinely its own: the
+        solve.
 
         ``routed_scaling_factor`` is plumbed but left at its default: MLB only
         reads it when materializing a shared-expert decision, and vLLM's CUDA
-        path has no shared-expert dispatch to materialize.  Threading the real
-        value down from the MoE layer would add invasiveness for a value
-        nothing on this path consumes.
+        path has no shared-expert dispatch to materialize.
         """
-        from moe_load_balancer.adapters.vllm import (
-            to_routing_request,
-            to_vllm_topk_ids,
-        )
+        from moe_load_balancer.adapters.vllm import to_routing_request
 
         layer_id = layer_state.moe_layer_idx
         if layer_id is None:
@@ -358,16 +336,16 @@ class MlbRoutingRuntime:
                 stage=_current_stage(),
                 token_count=num_unpadded_tokens,
                 routed_scaling_factor=routed_scaling_factor,
+                defer_dispatch=True,
             )
         )
-        physical = to_vllm_topk_ids(decision)
-        _record_physical_load(
-            physical,
-            layer_state.expert_load_view,
-            layer_state.should_record_tensor,
-            num_unpadded_tokens,
-        )
-        return physical
+        selection = decision.metadata.get("replica_selection")
+        if selection is None:
+            # The policy could not express itself as a table (or skipped this
+            # batch -- stage gating, no redundancy, empty tokens). Fall back to
+            # vLLM's own choice rather than silently dropping the decision.
+            return None
+        return selection.probability
 
 
 def init_mlb_routing(

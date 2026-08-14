@@ -23,7 +23,6 @@ from vllm.distributed.eplb.eplb_state import (  # noqa: E402
 )
 from vllm.distributed.eplb.mlb_runtime import (  # noqa: E402
     MlbRoutingRuntime,
-    _record_physical_load,
     reset_mlb_routing,
 )
 
@@ -77,84 +76,33 @@ def _layer_state(rt: MlbRoutingRuntime, layer_id: int = 0) -> EplbLayerState:
     return state
 
 
-@pytest.mark.parametrize("algorithm", ["static", "dynamic"])
-def test_routing_preserves_logical_experts(algorithm):
-    """The accuracy-preserving invariant, stated as a test.
+def test_lplb_asks_for_the_table_rather_than_the_ids():
+    """MLB is asked how to split traffic, not for per-token ids -- that is what
+    keeps expert-load recording inside vLLM's kernel.
 
-    Mapping each returned physical slot back through physical_to_logical_map
-    must reproduce the router's original logical choice exactly.
+    `lplb` needs an EP all-reduce to solve, so it cannot run in a single
+    process; assert on the request this path builds instead. The table is
+    consumed by the kernel, which has its own tests.
     """
-    rt = _runtime(algorithm)
-    state = _layer_state(rt)
-    torch.manual_seed(0)
-    logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
-    weights = torch.rand(NUM_TOKENS, TOPK)
+    from moe_load_balancer.adapters.vllm import to_routing_request
 
-    physical = rt.route(logical, weights, state, None)
-
-    assert physical.shape == logical.shape
-    assert int(physical.min()) >= 0 and int(physical.max()) < NUM_PHYSICAL
-    back = rt.physical_to_logical_map[0][physical]
-    assert torch.equal(back, logical), (
-        "MLB routing changed the logical expert selection"
+    request = to_routing_request(
+        layer_id=0,
+        logical_topk_ids=torch.zeros(2, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(2, 2),
+        defer_dispatch=True,
     )
+    assert request.defer_dispatch is True
 
 
-def test_routing_uses_redundant_replicas():
-    """A replica policy that never picks the second copy is a no-op; make sure
-    the redundant slots actually receive traffic (this is exactly the failure
-    mode found earlier in SGLang's qwen3_moe path)."""
-    rt = _runtime("dynamic")
-    state = _layer_state(rt)
-    torch.manual_seed(0)
-    # Only route to logical experts that have two replicas.
-    logical = torch.randint(
-        0, NUM_PHYSICAL - NUM_LOGICAL, (512, TOPK), dtype=torch.int64
-    )
-    physical = rt.route(logical, torch.rand(512, TOPK), state, None)
-    redundant_hits = int((physical >= NUM_LOGICAL).sum())
-    assert redundant_hits > 0, "redundant replicas received zero traffic"
-
-
-def test_load_recording_matches_fused_kernel_semantics():
-    """MLB takes over mapping, so recording is done separately; it must keep
-    the fused kernel's semantics: physical counting, gated by record_enabled,
-    and masking padded tokens."""
-    load = torch.zeros(NUM_PHYSICAL, dtype=torch.int64)
-    ids = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int64)
-    enabled = torch.tensor(1, dtype=torch.int32)
-
-    _record_physical_load(ids, load, enabled, None)
-    expected = torch.zeros(NUM_PHYSICAL, dtype=torch.int64)
-    expected[:6] = 1
-    assert torch.equal(load, expected)
-
-    # Gate off: nothing recorded.
-    load.zero_()
-    _record_physical_load(ids, load, torch.tensor(0, dtype=torch.int32), None)
-    assert int(load.sum()) == 0
-
-    # Padding mask: only the first two tokens are real.
-    load.zero_()
-    _record_physical_load(ids, load, enabled, torch.tensor(2, dtype=torch.int32))
-    assert int(load.sum()) == 4
-    assert int(load[4]) == 0 and int(load[5]) == 0
-
-    # Negative ids (vLLM marks padded rows with -1) must not be counted.
-    load.zero_()
-    _record_physical_load(
-        torch.tensor([[-1, -1], [2, 3]], dtype=torch.int64), load, enabled, None
-    )
-    assert int(load.sum()) == 2
-
-
-def test_recorded_load_totals_match_routing():
+def test_replica_shares_is_none_when_policy_cannot_produce_one():
+    """`dynamic` makes a per-token choice with no table behind it; the caller
+    must fall back rather than treat a missing table as 'all zeros'."""
     rt = _runtime("dynamic")
     state = _layer_state(rt)
     torch.manual_seed(0)
     logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
-    rt.route(logical, torch.rand(NUM_TOKENS, TOPK), state, None)
-    assert int(state.expert_load_view.sum()) == NUM_TOKENS * TOPK
+    assert rt.replica_shares(logical, torch.rand(NUM_TOKENS, TOPK), state, None) is None
 
 
 def test_synthesized_default_prefers_local_replicas():
@@ -219,11 +167,13 @@ def test_placement_commit_refreshes_policy_state():
     state = _layer_state(rt)
     torch.manual_seed(0)
     logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
-    physical = rt.route(logical, torch.rand(NUM_TOKENS, TOPK), state, None)
-    back = rt.physical_to_logical_map[0][physical]
-    assert torch.equal(back, logical), (
-        "routing broke after a committed placement change"
+    # The snapshot handed to MLB must reflect the committed maps, not the ones
+    # captured at registration.
+    snapshot = rt._snapshot(state, 0)
+    assert torch.equal(
+        snapshot.logical_to_physical_candidates, rt._logical_to_physical_map[0]
     )
+    assert rt.replica_shares(logical, torch.rand(NUM_TOKENS, TOPK), state, None) is None
 
 
 def test_capabilities_gate_the_work_the_framework_does():

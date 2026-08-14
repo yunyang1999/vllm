@@ -24,12 +24,15 @@ if current_platform.is_cuda_alike():
         out_ptr,
         record_enabled_ptr,
         num_unpadded_tokens_ptr,
+        replica_prob_ptr,
         num_logical_experts,
         map_slots,
         out_size,
         numel,
         num_active_experts,
         HAS_NUM_UNPADDED: tl.constexpr,
+        HAS_REPLICA_PROB: tl.constexpr,
+        MAP_SLOTS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -53,6 +56,34 @@ if current_platform.is_cuda_alike():
         token_idx = (offs // num_active_experts).to(tl.int64)
         hashed = (token_idx * KNUTH_MULTIPLIER) & 0xFFFFFFFF
         replica_idx = hashed % replica_count
+
+        if HAS_REPLICA_PROB:
+            # A load-balancing policy supplied per-expert replica shares. Use
+            # the same hash as a uniform draw and invert the row's CDF, so the
+            # choice stays a pure function of the token index: every rank
+            # computes the same replica for the same token without exchanging
+            # anything, and no RNG state enters the CUDA graph.
+            row = safe_expert_id * MAP_SLOTS
+            total = tl.zeros_like(hashed).to(tl.float32)
+            for j in tl.static_range(MAP_SLOTS):
+                total += tl.load(
+                    replica_prob_ptr + row + j, mask=mask & valid_expert, other=0.0
+                )
+            # 2^32; hashed is already reduced modulo it.
+            draw = (hashed.to(tl.float32) / 4294967296.0) * total
+            acc = tl.zeros_like(total)
+            sampled = tl.zeros_like(replica_idx)
+            for j in tl.static_range(MAP_SLOTS):
+                acc += tl.load(
+                    replica_prob_ptr + row + j, mask=mask & valid_expert, other=0.0
+                )
+                # Index = how many prefix sums stay at or below the draw.
+                sampled += tl.where(acc <= draw, 1, 0)
+            sampled = tl.minimum(sampled, replica_count - 1)
+            # An all-zero row means "no preference"; keep the hash's uniform
+            # pick rather than collapsing every token onto replica 0.
+            replica_idx = tl.where(total > 0.0, sampled, replica_idx)
+
         map_index = safe_expert_id * map_slots + replica_idx
         physical_id = tl.load(
             logical_to_physical_ptr + map_index,
@@ -99,6 +130,7 @@ if current_platform.is_cuda_alike():
         expert_load_view: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None,
+        replica_prob: torch.Tensor | None = None,
     ) -> torch.Tensor:
         topk_ids_in = topk_ids.contiguous().to(dtype=torch.int32)
         numel = topk_ids_in.numel()
@@ -108,6 +140,14 @@ if current_platform.is_cuda_alike():
         out_flat = torch.empty((numel,), device=topk_ids.device, dtype=topk_ids.dtype)
         grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
         assert expert_load_view.is_contiguous()
+        map_slots = logical_to_physical_map.shape[1]
+        if replica_prob is not None:
+            assert replica_prob.shape == logical_to_physical_map.shape, (
+                "replica shares must share the candidate map's layout: "
+                f"{tuple(replica_prob.shape)} vs "
+                f"{tuple(logical_to_physical_map.shape)}"
+            )
+            replica_prob = replica_prob.contiguous().to(torch.float32)
         _eplb_map_and_record_i32_kernel[grid](
             topk_ids_in,
             logical_replica_count.contiguous(),
@@ -116,12 +156,15 @@ if current_platform.is_cuda_alike():
             expert_load_view,
             record_enabled,
             num_unpadded_tokens,
+            replica_prob,
             logical_replica_count.shape[0],
-            logical_to_physical_map.shape[1],
+            map_slots,
             expert_load_view.shape[0],
             numel,
             num_active_experts,
             HAS_NUM_UNPADDED=num_unpadded_tokens is not None,
+            HAS_REPLICA_PROB=replica_prob is not None,
+            MAP_SLOTS=map_slots,
             BLOCK_SIZE=256,
         )
         return out_flat.reshape(topk_ids.shape)
@@ -137,11 +180,12 @@ if current_platform.is_cuda_alike():
         layer_state: object | None = None,
         topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # A pluggable routing policy replaces only the replica choice; load
-        # recording still has to happen, so the policy path records separately
-        # instead of using the fused kernel below.  `layer_state` and
-        # `topk_weights` are what such a policy needs beyond the fused kernel's
-        # arguments; callers that cannot supply them keep the built-in path.
+        # A pluggable load balancer decides how each logical expert's traffic
+        # should be split across its replicas; it does not need to own the
+        # per-token step. Ask it for that split and keep the fused kernel --
+        # which means load recording, the record gate and the padding mask all
+        # stay exactly as they are, with nothing reimplemented alongside them.
+        replica_prob = None
         if layer_state is not None and topk_weights is not None:
             from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
 
@@ -149,7 +193,7 @@ if current_platform.is_cuda_alike():
             # The policy itself declares whether it wants the routing boundary;
             # a pipeline with no post-TopK stage leaves the fused kernel alone.
             if routing is not None and routing.requires_post_topk_routing:
-                return routing.route(
+                replica_prob = routing.replica_shares(
                     topk_ids, topk_weights, layer_state, num_unpadded_tokens
                 )
 
@@ -161,6 +205,7 @@ if current_platform.is_cuda_alike():
             expert_load_view=expert_load_view,
             record_enabled=record_enabled,
             num_unpadded_tokens=num_unpadded_tokens,
+            replica_prob=replica_prob,
         )
 else:
 
