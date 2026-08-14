@@ -89,6 +89,11 @@ class EPLBConfig:
     policy: EPLBPolicyOption = "default"
     """The policy type for expert parallel load balancing (EPLB)."""
 
+    l2_algorithm: str = ""
+    """MoE Load Balancer routing expression for the L2 stage, which decides
+    which *replica* of a logical expert each token goes to. Empty leaves vLLM's
+    built-in choice in place. Defaults to ``$VLLM_MLB_L2_ALGORITHM``."""
+
     communicator: EPLBCommunicatorBackend | None = None
     """
     Backend for EPLB expert weight communication:
@@ -134,6 +139,36 @@ class EPLBConfig:
             )
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
+
+        if not self.l2_algorithm:
+            self.l2_algorithm = os.environ.get("VLLM_MLB_L2_ALGORITHM", "").strip()
+
+        # An L2 policy chooses among a logical expert's replicas. With no
+        # redundant experts there is exactly one replica each, so there is
+        # nothing to choose: the policy can only reproduce the mapping vLLM
+        # would have used anyway. Leaving it on is not merely useless -- the
+        # routing boundary is crossed per layer per forward, and a policy that
+        # consumes the EP-wide expert load pays a collective to produce a count
+        # it then discards.
+        #
+        # Turning it off here rather than making it cheap deeper down is what
+        # keeps it honest: the decision is visible, made once, and taken before
+        # anything sizes buffers or declares capabilities against it. Output is
+        # unaffected, which is what makes doing it silently unacceptable but
+        # doing it at all safe.
+        if self.l2_algorithm and self.num_redundant_experts == 0:
+            logger.warning(
+                "Disabling MoE Load Balancer L2 routing (%r): it selects among "
+                "replicas of a logical expert, and num_redundant_experts=0 "
+                "leaves every logical expert with exactly one. Routing is "
+                "unchanged by this -- the policy could only have reproduced it "
+                "-- but the per-layer routing boundary and its load collective "
+                "are now skipped. Set eplb_config.num_redundant_experts > 0 to "
+                "give it something to balance.",
+                self.l2_algorithm,
+            )
+            self.l2_algorithm = ""
+
         return self
 
 

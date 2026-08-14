@@ -297,3 +297,56 @@ def test_initial_placement_is_announced():
     rt._commit_layers = lambda ids: seen.append(list(ids))
     rt.announce_initial_placement()
     assert seen == [list(range(NUM_LAYERS))]
+
+
+def _runtime_with_redundancy(num_redundant: int) -> MlbRoutingRuntime:
+    """A runtime whose only interesting property is whether experts repeat."""
+    num_physical = NUM_LOGICAL + num_redundant
+    phy2log = torch.stack(
+        [torch.arange(num_physical) % NUM_LOGICAL for _ in range(NUM_LAYERS)]
+    )
+    return MlbRoutingRuntime(
+        "lplb",
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        num_logical_experts=NUM_LOGICAL,
+        num_physical_experts=num_physical,
+        physical_to_logical_map=phy2log,
+    )
+
+
+@pytest.mark.parametrize("num_redundant, allocated", [(0, False), (8, True)])
+def test_lplb_count_buffers_exist_only_where_an_expert_is_replicated(
+    num_redundant, allocated, monkeypatch
+):
+    """An LP with nothing to split must not cost a collective every step.
+
+    Without redundant experts every logical expert holds exactly one replica,
+    so LPLB returns identity dispatch and never reads the count. These buffers
+    are what make vLLM run a per-layer count kernel and one EP all-reduce per
+    step to produce it -- work whose result is then discarded.
+    """
+    monkeypatch.delenv("MLB_KEEP_ZERO_REDUNDANCY_COUNTS", raising=False)
+    rt = _runtime_with_redundancy(num_redundant)
+    assert (rt._lplb_local_count is not None) is allocated
+    assert (rt._lplb_global_count is not None) is allocated
+
+
+def test_the_zero_redundancy_override_restores_the_buffers(monkeypatch):
+    """The override exists so the skipped work has a measured size rather than
+    only an argued one; a benchmark that cannot restore the old path cannot
+    report what removing it bought."""
+    monkeypatch.setenv("MLB_KEEP_ZERO_REDUNDANCY_COUNTS", "1")
+    rt = _runtime_with_redundancy(0)
+    assert rt._lplb_local_count is not None
+    assert rt._lplb_global_count is not None
+
+
+def test_finalize_step_counts_is_inert_without_buffers(monkeypatch):
+    """It must not reach for the EP group when there is nothing to reduce.
+
+    These tests run with no distributed init, so an unguarded get_ep_group()
+    would raise -- which is exactly the assertion.
+    """
+    monkeypatch.delenv("MLB_KEEP_ZERO_REDUNDANCY_COUNTS", raising=False)
+    _runtime_with_redundancy(0).finalize_step_counts()

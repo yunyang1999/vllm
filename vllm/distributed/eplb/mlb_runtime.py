@@ -220,6 +220,7 @@ class MlbRoutingRuntime:
         # zeros → hash routing fallback via selection is None).
         self._lplb_count_initialized = False
 
+
     def finalize_step_counts(self) -> None:
         """All-reduce per-layer local counts and update the stable LP input buffer.
 
@@ -550,6 +551,7 @@ def _reject_graphs_with_rearranging_placement_state(rearranges: bool) -> None:
 
 def init_mlb_routing(
     *,
+    algorithm: str,
     ep_size: int,
     ep_rank: int,
     num_logical_experts: int,
@@ -559,9 +561,14 @@ def init_mlb_routing(
     logical_replica_count: torch.Tensor,
     rearranges: bool = False,
 ) -> MlbRoutingRuntime | None:
-    """Create the routing runtime if ``VLLM_MLB_L2_ALGORITHM`` is set."""
+    """Create the routing runtime for a configured L2 algorithm.
+
+    ``algorithm`` comes from ``EPLBConfig.l2_algorithm``, which has already
+    resolved the environment default and cleared itself for placements no L2
+    policy can act on. Passing it in rather than re-reading the environment is
+    what makes that decision binding.
+    """
     global _runtime
-    algorithm = mlb_l2_algorithm()
     if not algorithm:
         return None
     _runtime = MlbRoutingRuntime(

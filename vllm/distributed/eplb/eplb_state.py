@@ -524,24 +524,27 @@ class EplbState:
             self._install_initial_placement(model_state, pending_init_p2l)
 
         # Optional: hand L2 replica choice to the MoE Load Balancer.  A no-op
-        # unless VLLM_MLB_L2_ALGORITHM is set, in which case vLLM's fused
+        # unless an L2 algorithm is configured, in which case vLLM's fused
         # mapping kernel is bypassed at the routing boundary.
-        from vllm.distributed.eplb.mlb_runtime import (
-            init_mlb_routing,
-            mlb_l2_algorithm,
-        )
+        #
+        # Read from the config rather than the environment: EPLBConfig resolves
+        # $VLLM_MLB_L2_ALGORITHM once and clears it for placements the policy
+        # cannot act on, so by here the answer already accounts for redundancy.
+        from vllm.distributed.eplb.mlb_runtime import init_mlb_routing
 
-        if mlb_l2_algorithm():
+        l2_algorithm = self.parallel_config.eplb_config.l2_algorithm
+        if l2_algorithm:
             if self.parallel_config.num_ubatches > 1:
                 raise ValueError(
-                    "VLLM_MLB_L2_ALGORITHM is incompatible with DBO: MLB's "
+                    "MoE Load Balancer L2 routing is incompatible with DBO: MLB's "
                     "routing request carries a single token count and its "
                     "policies keep one solver state per layer, so concurrent "
                     "micro-batches would clobber each other. Disable DBO or "
-                    "unset VLLM_MLB_L2_ALGORITHM."
+                    "clear eplb_config.l2_algorithm."
                 )
             ep_group = get_ep_group()
             routing = init_mlb_routing(
+                algorithm=l2_algorithm,
                 ep_size=ep_group.world_size,
                 ep_rank=ep_group.rank_in_group,
                 num_logical_experts=model.num_logical_experts,
