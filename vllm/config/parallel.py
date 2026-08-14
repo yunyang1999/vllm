@@ -99,6 +99,28 @@ class EPLBConfig:
     - None: Auto-select backend (prefers "nixl", falls back to "torch_gloo")
     """
 
+    init_placement_path: str | None = None
+    """
+    Path to a placement checkpoint saved by a previous profiling run.
+
+    When set, the initial physical_to_logical_map is loaded from this file
+    instead of using the trivial (uniform) assignment.  This is the vLLM
+    equivalent of SGLang's ``--init-expert-location``: profile once, save the
+    MLB-optimised placement, then start production with that placement pre-loaded
+    so LPLB has hot experts already replicated.
+
+    The file must have been written by ``save_placement_path`` on a model with
+    the same topology (num_moe_layers, num_physical_experts).
+    """
+
+    save_placement_path: str | None = None
+    """
+    If set, write the current physical_to_logical_map to this path after every
+    rearrangement.  The most recent rearrangement overwrites the previous file.
+    Use in a short profiling run to capture a good placement, then pass the
+    result to ``init_placement_path`` in the serving run.
+    """
+
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
         if self.use_async and self.policy != "default":

@@ -61,6 +61,11 @@ from .rebalance_execute import (
 logger = init_logger(__name__)
 
 
+# A step interval this large means the deployment never intends to re-plan;
+# treat it as "placement is pinned" rather than as a very slow cadence.
+_REARRANGEMENT_EFFECTIVELY_DISABLED = 1_000_000
+
+
 @dataclass
 class EplbStats:
     """
@@ -360,67 +365,87 @@ class EplbState:
         self.validate_ep_configuration(model)
         self.is_async = self.parallel_config.eplb_config.use_async
 
-        physical_to_logical_map_list = (
-            EplbState.build_initial_global_physical_to_logical_map(
-                model.num_routed_experts,
-                model.num_redundant_experts,
-            )
-        )
-        physical_to_logical_map = torch.tensor(
-            physical_to_logical_map_list,
-            device=self.device,
-        )
-        # Assuming 8 GPUs per node, this supports up to
-        # (1023 + 1) / 8 = 128 nodes for now.
-        # TODO(rui): make this configurable
         MAX_EXPERT_REDUNDANCY = 1023
         assert model.num_redundant_experts <= MAX_EXPERT_REDUNDANCY, (
             f"num_redundant_experts {model.num_redundant_experts} "
             f"must be less than or equal to {MAX_EXPERT_REDUNDANCY}"
         )
         max_slots_per_logical_expert = MAX_EXPERT_REDUNDANCY + 1
-        logical_to_physical_map = torch.full(
-            (model.num_logical_experts, max_slots_per_logical_expert),
-            -1,
-            device=self.device,
-        )
-        logical_replica_count = torch.zeros(
-            (model.num_logical_experts,),
-            device=self.device,
-            dtype=torch.long,
-        )
 
-        for i in range(model.num_physical_experts):
-            logical_idx = physical_to_logical_map[i]
-            logical_to_physical_map[logical_idx, logical_replica_count[logical_idx]] = i
-            logical_replica_count[logical_idx] += 1
+        init_path = self.parallel_config.eplb_config.init_placement_path
+        if init_path:
+            # Saved as [num_moe_layers, num_physical_experts] -- each layer has
+            # its own optimised placement.  Derive logical maps from the full
+            # per-layer tensor via compute_logical_maps (CPU, then move to GPU).
+            p2l_full = torch.load(init_path, map_location="cpu",
+                                  weights_only=True).long()
+            assert p2l_full.shape == (
+                model.num_moe_layers, model.num_physical_experts
+            ), (
+                f"Placement checkpoint shape {tuple(p2l_full.shape)} does not "
+                f"match model ({model.num_moe_layers}, {model.num_physical_experts})"
+            )
+            l2p_cpu, lr_cpu = compute_logical_maps(
+                p2l_full, model.num_logical_experts
+            )
+            # Pad l2p to max_slots_per_logical_expert
+            num_layers, nl, cur_slots = l2p_cpu.shape
+            padded = torch.full(
+                (num_layers, nl, max_slots_per_logical_expert), -1
+            )
+            padded[:, :, :cur_slots] = l2p_cpu
+            physical_to_logical_map = p2l_full.to(self.device)
+            logical_to_physical_map = padded.to(self.device)
+            logical_replica_count = lr_cpu.to(self.device)
+            logger.info(
+                "EPLB: loaded per-layer placement from %s "
+                "(layers=%d, num_physical=%d)",
+                init_path,
+                model.num_moe_layers,
+                model.num_physical_experts,
+            )
+        else:
+            physical_to_logical_map_list = (
+                EplbState.build_initial_global_physical_to_logical_map(
+                    model.num_routed_experts,
+                    model.num_redundant_experts,
+                )
+            )
+            p2l_1d = torch.tensor(
+                physical_to_logical_map_list,
+                device=self.device,
+            )
+            logical_to_physical_map = torch.full(
+                (model.num_logical_experts, max_slots_per_logical_expert),
+                -1,
+                device=self.device,
+            )
+            logical_replica_count = torch.zeros(
+                (model.num_logical_experts,),
+                device=self.device,
+                dtype=torch.long,
+            )
+            for i in range(model.num_physical_experts):
+                logical_idx = p2l_1d[i]
+                logical_to_physical_map[
+                    logical_idx, logical_replica_count[logical_idx]
+                ] = i
+                logical_replica_count[logical_idx] += 1
 
-        # Duplicate initial mapping for all layers
-        physical_to_logical_map = (
-            physical_to_logical_map.unsqueeze(0)
-            .expand(
-                model.num_moe_layers,
-                -1,
+            # Duplicate initial mapping for all layers
+            physical_to_logical_map = (
+                p2l_1d.unsqueeze(0).expand(model.num_moe_layers, -1).contiguous()
             )
-            .contiguous()
-        )
-        logical_to_physical_map = (
-            logical_to_physical_map.unsqueeze(0)
-            .expand(
-                model.num_moe_layers,
-                -1,
-                -1,
+            logical_to_physical_map = (
+                logical_to_physical_map.unsqueeze(0)
+                .expand(model.num_moe_layers, -1, -1)
+                .contiguous()
             )
-            .contiguous()
-        )
-        logical_replica_count = (
-            logical_replica_count.unsqueeze(0)
-            .expand(
-                model.num_moe_layers,
-                -1,
+            logical_replica_count = (
+                logical_replica_count.unsqueeze(0)
+                .expand(model.num_moe_layers, -1)
+                .contiguous()
             )
-            .contiguous()
-        )
 
         expert_load_pass = torch.zeros(
             (model.num_moe_layers, model.num_physical_experts),
@@ -518,6 +543,13 @@ class EplbState:
                 physical_to_logical_map=physical_to_logical_map,
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
+                # A step interval that the run can actually reach means the
+                # placement will be re-planned, which is the case a captured
+                # graph cannot follow when the policy keeps solver state.
+                rearranges=(
+                    self.expert_rearrangement_step_interval
+                    < _REARRANGEMENT_EFFECTIVELY_DISABLED
+                ),
             )
             if routing is not None:
                 # The contract is "after initial weight loading and after each
@@ -974,6 +1006,18 @@ class EplbState:
                         " (profile) " if is_profile else " ",
                         gpu_elapsed,
                     )
+                    save_path = (
+                        self.parallel_config.eplb_config.save_placement_path
+                    )
+                    if save_path and not is_profile:
+                        torch.save(
+                            eplb_model_state.physical_to_logical_map.cpu(),
+                            save_path,
+                        )
+                        logger.info(
+                            "EPLB: saved placement checkpoint to %s",
+                            save_path,
+                        )
             else:
                 eplb_model_state.eplb_stats = EplbStats(
                     # We copy the tensor to snapshot the global_expert_load_window
