@@ -220,6 +220,16 @@ class MlbRoutingRuntime:
         # zeros → hash routing fallback via selection is None).
         self._lplb_count_initialized = False
 
+        # MLB_FRESH_COUNTS=1 withholds the pre-computed count so MLB gathers it
+        # itself, per layer per forward. That is what the SGLang adapter does and
+        # what LPLB's published numbers were measured against; the count here is
+        # one step stale so the collective can live outside the CUDA graph.
+        # Staleness is a good approximation in decode, where the routing
+        # distribution moves slowly, and a worse one in chunked prefill, where
+        # consecutive chunks can differ sharply -- so a measured LPLB regression
+        # cannot be attributed to the algorithm without checking this. Read once:
+        # replica_shares runs per layer per forward.
+        self._fresh_counts = os.environ.get("MLB_FRESH_COUNTS") == "1"
 
     def finalize_step_counts(self) -> None:
         """All-reduce per-layer local counts and update the stable LP input buffer.
@@ -483,9 +493,13 @@ class MlbRoutingRuntime:
         # captured CUDA graph: on replay the LP solve reads whatever value
         # finalize_step_counts deposited before the graph was launched.
         global_count = (
-            self._lplb_global_count[layer_id]
-            if self._lplb_global_count is not None
-            else None
+            None
+            if self._fresh_counts
+            else (
+                self._lplb_global_count[layer_id]
+                if self._lplb_global_count is not None
+                else None
+            )
         )
 
         decision = self._mlb.route_tokens(
