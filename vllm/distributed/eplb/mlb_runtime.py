@@ -193,7 +193,20 @@ class MlbRoutingRuntime:
         # converges).
         num_moe_layers = physical_to_logical_map.shape[0]
         dev = physical_to_logical_map.device
-        if self.requires_post_topk_routing:
+        # Gated on redundancy as well as on the policy.  With no redundant
+        # experts every logical has exactly one replica, the LP is degenerate,
+        # and LPLB answers with identity dispatch without ever reading the
+        # count -- so keeping these buffers would buy a per-layer count kernel
+        # plus one collective per step for a result that is thrown away.
+        # Leaving them None also makes MLB decline to gather the count itself
+        # (needs_global_logical_count), so nothing downstream pays for it.
+        # MLB_KEEP_ZERO_REDUNDANCY_COUNTS=1 restores the ungated behaviour so the
+        # cost of that discarded work can be measured against this, rather than
+        # only argued for.
+        keep_degenerate = os.environ.get("MLB_KEEP_ZERO_REDUNDANCY_COUNTS") == "1"
+        if self.requires_post_topk_routing and (
+            self._max_replicas > 1 or keep_degenerate
+        ):
             self._lplb_local_count: torch.Tensor | None = torch.zeros(
                 num_moe_layers, num_logical_experts, dtype=torch.float32, device=dev
             )
