@@ -345,6 +345,14 @@ class MlbRoutingRuntime:
         reads it when materializing a shared-expert decision, and vLLM's CUDA
         path has no shared-expert dispatch to materialize.
         """
+        # LPLB's _global_logical_count does an EP NCCL all_reduce which cannot
+        # be captured in a CUDA graph.  Return None during capture so the fused
+        # Triton kernel falls back to hash routing for that shape.  CUDA graph
+        # replay then uses hash routing for small (decode) batches.  Large
+        # prefill batches always run in eager mode and reach the LP path normally.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+
         from moe_load_balancer.adapters.vllm import to_routing_request
 
         layer_id = layer_state.moe_layer_idx
