@@ -133,7 +133,24 @@ if current_platform.is_cuda_alike():
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
+        *,
+        layer_state: object | None = None,
+        topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # A pluggable routing policy replaces only the replica choice; load
+        # recording still has to happen, so the policy path records separately
+        # instead of using the fused kernel below.  `layer_state` and
+        # `topk_weights` are what such a policy needs beyond the fused kernel's
+        # arguments; callers that cannot supply them keep the built-in path.
+        if layer_state is not None and topk_weights is not None:
+            from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+
+            routing = get_mlb_routing()
+            if routing is not None:
+                return routing.route(
+                    topk_ids, topk_weights, layer_state, num_unpadded_tokens
+                )
+
         # Fused triton implementation: mapping + optional recording in one kernel.
         return _eplb_map_and_record_triton(
             topk_ids=topk_ids,
@@ -152,6 +169,9 @@ else:
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
+        *,
+        layer_state: object | None = None,
+        topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return topk_ids
 
@@ -201,7 +221,11 @@ class BaseRouter(FusedMoERouter):
             if eplb_state.num_unpadded_tokens_tensors is None:
                 raise ValueError("EPLB requires num_unpadded_tokens_tensors != None")
 
-    def _apply_eplb_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
+    def _apply_eplb_mapping(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Apply EPLB mapping to convert logical expert IDs to physical expert IDs."""
         if self.eplb_state is not None:
             eplb_state = self.eplb_state
@@ -219,6 +243,8 @@ class BaseRouter(FusedMoERouter):
                 num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
                     dbo_current_ubatch_id()
                 ],
+                layer_state=eplb_state,
+                topk_weights=topk_weights,
             )
         return topk_ids
 
@@ -297,7 +323,7 @@ class BaseRouter(FusedMoERouter):
             self.capture_fn(topk_ids)
 
         # Step 3: Apply EPLB mapping
-        topk_ids = self._apply_eplb_mapping(topk_ids)
+        topk_ids = self._apply_eplb_mapping(topk_ids, topk_weights)
 
         # Step 4: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, topk_indices_dtype)

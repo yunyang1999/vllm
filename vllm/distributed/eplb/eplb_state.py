@@ -492,6 +492,34 @@ class EplbState:
         self.model_states[model_config.compute_hash()] = model_state
         self.num_valid_physical_experts = model.num_physical_experts
 
+        # Optional: hand L2 replica choice to the MoE Load Balancer.  A no-op
+        # unless VLLM_MLB_L2_ALGORITHM is set, in which case vLLM's fused
+        # mapping kernel is bypassed at the routing boundary.
+        from vllm.distributed.eplb.mlb_runtime import (
+            init_mlb_routing,
+            mlb_l2_algorithm,
+        )
+
+        if mlb_l2_algorithm():
+            if self.parallel_config.num_ubatches > 1:
+                raise ValueError(
+                    "VLLM_MLB_L2_ALGORITHM is incompatible with DBO: MLB's "
+                    "routing request carries a single token count and its "
+                    "policies keep one solver state per layer, so concurrent "
+                    "micro-batches would clobber each other. Disable DBO or "
+                    "unset VLLM_MLB_L2_ALGORITHM."
+                )
+            ep_group = get_ep_group()
+            init_mlb_routing(
+                ep_size=ep_group.world_size,
+                ep_rank=ep_group.rank_in_group,
+                num_logical_experts=model.num_logical_experts,
+                num_physical_experts=model.num_physical_experts,
+                physical_to_logical_map=physical_to_logical_map,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+            )
+
     def prepare_forward(
         self,
         model_config: ModelConfig,
@@ -900,6 +928,14 @@ class EplbState:
                             eplb_model_state,
                             new_physical_to_logical_map=new_physical_to_logical_map,
                         )
+                        # Weights have moved and the live maps are updated, so
+                        # a pluggable routing policy may now rebuild any
+                        # placement-derived state.
+                        from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+
+                        routing = get_mlb_routing()
+                        if routing is not None:
+                            routing.on_placement_committed()
 
                 if is_main_rank:
                     assert start_event is not None
@@ -1106,6 +1142,20 @@ class EplbLayerState:
     Reference to the parent :class:`EplbModelState`'s tensor list so the
     router can read the correct per-[u]batch unpadded token count.
     """
+    moe_layer_idx: int | None = None
+    """
+    Index of this layer among the model's MoE layers.
+
+    The built-in mapping kernel is stateless and does not need it, but a
+    pluggable routing policy (see ``mlb_runtime``) keys its per-layer state by
+    it.  Recording it here is free: ``set_layer_state`` already receives it.
+
+    Note that the layer state deliberately does *not* carry
+    ``physical_to_logical_map``: threading it down would change
+    ``MixtureOfExperts.set_eplb_state``, a public interface implemented by
+    every MoE model.  A policy that needs the physical->logical direction takes
+    the model-level tensor from :class:`EplbState` and slices it by this index.
+    """
 
     def set_layer_state(
         self,
@@ -1114,6 +1164,7 @@ class EplbLayerState:
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
+        self.moe_layer_idx = moe_layer_idx
         self.expert_load_view = expert_load_view[moe_layer_idx]
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
