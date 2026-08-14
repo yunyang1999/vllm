@@ -207,6 +207,31 @@ class MlbRoutingRuntime:
         """
         from moe_load_balancer.core.types import PlacementSnapshot
 
+        # KNOWN ISSUE (measured 2026-08-11, DeepSeek-style MoE, TP2/EP2):
+        # with the `lplb` policy this hook kills the worker at the first
+        # rearrangement -- silently, with no Python traceback.  Steady-state
+        # lplb routing is fine: with rearrangement disabled the same build
+        # serves correctly, and with this hook skipped rearrangement also runs
+        # clean, so the fault is inside the per-layer rebuild below rather than
+        # in lplb's routing or in vLLM's weight movement.
+        #
+        # Ruled out by experiment: racing the `non_blocking=True` map commit (a
+        # full torch.cuda.synchronize() here does not help) and GPU memory
+        # pressure (unchanged at gpu_memory_utilization=0.55).  The leading
+        # remaining hypothesis is a candidate-table *width* change: vLLM pads
+        # `logical_to_physical_map` with `_pad_out_tensor`, so max-replicas can
+        # differ before and after a rearrangement, and LPLBL2Router.prepare_layer
+        # documents shape-changing updates as the path that replaces -- rather
+        # than updates in place -- its prepared state.
+        #
+        # Until that is fixed, `MLB_SKIP_COMMIT_HOOK=1` is the workaround: the
+        # policy then keeps serving from its initial placement state.  That is
+        # only correct while the placement it derived state from is still live,
+        # so it is a triage aid, not a supported configuration.
+        if os.environ.get("MLB_SKIP_COMMIT_HOOK") == "1":
+            logger.warning("MLB placement-commit hook skipped (MLB_SKIP_COMMIT_HOOK=1)")
+            return
+
         self._rebuild_default_replicas()
         num_layers = self._logical_to_physical_map.shape[0]
         for layer_id in range(num_layers):
