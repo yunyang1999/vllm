@@ -168,6 +168,68 @@ class MlbRoutingRuntime:
             self.requires_rank_dispatch_map,
         )
 
+        # Graph-safe global count cache for LPLB.
+        #
+        # LPLB's LP solve needs global_logical_count: how many tokens each
+        # logical expert received across all EP ranks.  The naive path inside
+        # MLB does count_logical_experts(topk_ids) + EP all_reduce per layer
+        # per forward, which is 40 NCCL collectives per step -- and NCCL
+        # cannot be captured in a CUDA graph.
+        #
+        # The fix: split "compute local count" (CUDA kernel, graph-safe) from
+        # "all_reduce" (outside the graph, once per step).
+        #
+        # _lplb_local_count[layer, expert]: local counts accumulated per-layer
+        #   inside the graph by count_logical_experts; reset each step.
+        # _lplb_global_count[layer, expert]: all-reduced result of the previous
+        #   step, stable GPU address, read by LP solve inside the graph.
+        #
+        # The LP solve therefore uses counts stale by one step, which is an
+        # excellent approximation for decode (distribution barely changes) and
+        # acceptable for prefill (first step uses zeros → hash routing, then
+        # converges).
+        num_moe_layers = physical_to_logical_map.shape[0]
+        dev = physical_to_logical_map.device
+        if self.requires_post_topk_routing:
+            self._lplb_local_count: torch.Tensor | None = torch.zeros(
+                num_moe_layers, num_logical_experts, dtype=torch.float32, device=dev
+            )
+            self._lplb_global_count: torch.Tensor | None = torch.zeros(
+                num_moe_layers, num_logical_experts, dtype=torch.float32, device=dev
+            )
+        else:
+            self._lplb_local_count = None
+            self._lplb_global_count = None
+        # True once finalize_step_counts has run at least once (first step uses
+        # zeros → hash routing fallback via selection is None).
+        self._lplb_count_initialized = False
+
+    def finalize_step_counts(self) -> None:
+        """All-reduce per-layer local counts and update the stable LP input buffer.
+
+        Call at the START of each forward pass (from EplbState.prepare_forward).
+        By the time this runs, the previous step's count_logical_experts results
+        are already in _lplb_local_count (written per-layer inside the graph or
+        in the eager forward).
+
+        One EP collective for all 40 layers combined replaces the 40 per-layer
+        collectives that MLB's _global_logical_count would otherwise issue.
+        Running outside the graph means NCCL is never captured -- graphs only
+        see the LP solve kernels reading from _lplb_global_count.
+        """
+        if self._lplb_local_count is None or self._lplb_global_count is None:
+            return
+        # Never run inside a CUDA graph capture stream.  prepare_forward is
+        # normally called outside graph context, but guard explicitly.
+        if torch.cuda.is_current_stream_capturing():
+            return
+        from vllm.distributed import get_ep_group
+        ep_group = get_ep_group()
+        ep_group.all_reduce(self._lplb_local_count)
+        self._lplb_global_count.copy_(self._lplb_local_count)
+        self._lplb_local_count.zero_()
+        self._lplb_count_initialized = True
+
     def set_physical_to_logical_map(self, mapping: torch.Tensor) -> None:
         self.physical_to_logical_map = mapping
 
@@ -345,15 +407,13 @@ class MlbRoutingRuntime:
         reads it when materializing a shared-expert decision, and vLLM's CUDA
         path has no shared-expert dispatch to materialize.
         """
-        # LPLB's _global_logical_count does an EP NCCL all_reduce which cannot
-        # be captured in a CUDA graph.  Return None during capture so the fused
-        # Triton kernel falls back to hash routing for that shape.  CUDA graph
-        # replay then uses hash routing for small (decode) batches.  Large
-        # prefill batches always run in eager mode and reach the LP path normally.
-        if torch.cuda.is_current_stream_capturing():
+        # First step: global count buffer is zero-initialised (no real data yet).
+        # Return None → hash routing until finalize_step_counts has run once.
+        if not self._lplb_count_initialized:
             return None
 
         from moe_load_balancer.adapters.vllm import to_routing_request
+        from moe_load_balancer.kernels.expert_count import count_logical_experts
 
         layer_id = layer_state.moe_layer_idx
         if layer_id is None:
@@ -361,6 +421,24 @@ class MlbRoutingRuntime:
                 "MLB routing requires EplbLayerState.moe_layer_idx; the layer "
                 "was registered by a path that does not set it."
             )
+
+        # Accumulate LOCAL count for this layer into the stable buffer.
+        # count_logical_experts is a CUDA kernel → captured in CUDA graphs.
+        # The all_reduce happens OUTSIDE the graph (in finalize_step_counts),
+        # so NCCL never touches the capture stream.
+        if self._lplb_local_count is not None:
+            local = count_logical_experts(topk_ids, self.num_logical_experts)
+            self._lplb_local_count[layer_id].copy_(local)
+
+        # Pass the PREVIOUS step's global count to MLB.  The stable tensor
+        # slice has a fixed GPU address, so it is safe to use inside a
+        # captured CUDA graph: on replay the LP solve reads whatever value
+        # finalize_step_counts deposited before the graph was launched.
+        global_count = (
+            self._lplb_global_count[layer_id]
+            if self._lplb_global_count is not None
+            else None
+        )
 
         decision = self._mlb.route_tokens(
             to_routing_request(
@@ -372,13 +450,11 @@ class MlbRoutingRuntime:
                 token_count=num_unpadded_tokens,
                 routed_scaling_factor=routed_scaling_factor,
                 defer_dispatch=True,
+                global_logical_count=global_count,
             )
         )
         selection = decision.metadata.get("replica_selection")
         if selection is None:
-            # The policy could not express itself as a table (or skipped this
-            # batch -- stage gating, no redundancy, empty tokens). Fall back to
-            # vLLM's own choice rather than silently dropping the decision.
             return None
         return selection.probability
 

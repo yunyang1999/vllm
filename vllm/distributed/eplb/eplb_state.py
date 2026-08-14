@@ -574,6 +574,16 @@ class EplbState:
                 ``UBatchSlice`` objects describing each micro-batch's
                 token range.  When ``None``, only ``tensors[0]`` is filled.
         """
+        # Finalise LPLB count cache from the previous forward pass.
+        # count_logical_experts fills _lplb_local_count per-layer inside the
+        # graph; we all_reduce and move to _lplb_global_count here (outside
+        # the graph, one collective for all layers).  This gives LP solve a
+        # stable, up-to-date input without any NCCL inside the capture stream.
+        from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+        routing = get_mlb_routing()
+        if routing is not None:
+            routing.finalize_step_counts()
+
         model_state = self.model_states.get(compute_hash_cached(model_config))
         if model_state is None or model_state.num_unpadded_tokens_tensors is None:
             return
