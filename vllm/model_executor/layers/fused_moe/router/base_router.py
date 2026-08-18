@@ -48,19 +48,24 @@ if current_platform.is_cuda_alike():
         valid_expert = (expert_id >= 0) & (expert_id < num_logical_experts)
         safe_expert_id = tl.where(valid_expert, expert_id, 0)
 
-        # 1. Convert the logical expert ids to physical expert ids
-        replica_count = tl.load(
-            logical_replica_count_ptr + safe_expert_id,
-            mask=mask & valid_expert,
-            other=1,
-        )
-        # Avoid invalid modulo/div by forcing at least 1.
-        replica_count = tl.maximum(replica_count, 1)
-        # floor(2^32 / phi), classic Knuth multiplicative hash multiplier.
-        KNUTH_MULTIPLIER = 2654435769
-        token_idx = (offs // num_active_experts).to(tl.int64)
-        hashed = (token_idx * KNUTH_MULTIPLIER) & 0xFFFFFFFF
-        replica_idx = hashed % replica_count
+        # 1. Convert the logical expert ids to physical expert ids.
+        # A policy that resolved the replica itself needs none of this:
+        # the count load and the hash exist only to pick a column, and
+        # leaving them in charged the direct path for a choice it had
+        # already made.
+        if not HAS_PHYSICAL_IDS:
+            replica_count = tl.load(
+                logical_replica_count_ptr + safe_expert_id,
+                mask=mask & valid_expert,
+                other=1,
+            )
+            # Avoid invalid modulo/div by forcing at least 1.
+            replica_count = tl.maximum(replica_count, 1)
+            # floor(2^32 / phi), classic Knuth multiplicative hash multiplier.
+            KNUTH_MULTIPLIER = 2654435769
+            token_idx = (offs // num_active_experts).to(tl.int64)
+            hashed = (token_idx * KNUTH_MULTIPLIER) & 0xFFFFFFFF
+            replica_idx = hashed % replica_count
 
         if HAS_REPLICA_PROB:
             # A load-balancing policy supplied per-expert replica shares. Use

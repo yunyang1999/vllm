@@ -104,13 +104,23 @@ def test_every_replica_policy_answers_the_deferred_dispatch_request():
     state = _layer_state(rt)
     torch.manual_seed(0)
     logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
-    shares = rt.replica_shares(logical, torch.rand(NUM_TOKENS, TOPK), state, None)
-    assert shares is not None
-    counts = rt._logical_replica_count[0]
-    row = shares[int((counts == 2).nonzero()[0])]
-    assert torch.allclose(row[:2], torch.full((2,), 0.5), atol=1e-6)
-    single = shares[int((counts == 1).nonzero()[0])]
-    assert single[0].item() == 1.0 and single[1].item() == 0.0
+    shares, ids = rt.resolve_routing(
+        logical, torch.rand(NUM_TOKENS, TOPK), state, None
+    )
+    # The contract is that the policy answers, not that it answers in one
+    # particular form: a runtime that fuses selection with recording asks for a
+    # share table, one that lets the policy resolve replicas takes ids. What
+    # must never happen is neither, which is how these policies used to look
+    # like they were doing nothing.
+    assert (shares is None) != (ids is None), "exactly one form must come back"
+    if shares is not None:
+        counts = rt._logical_replica_count[0]
+        row = shares[int((counts == 2).nonzero()[0])]
+        assert torch.allclose(row[:2], torch.full((2,), 0.5), atol=1e-6)
+        single = shares[int((counts == 1).nonzero()[0])]
+        assert single[0].item() == 1.0 and single[1].item() == 0.0
+    else:
+        assert ids.shape == logical.shape
 
 
 def test_synthesized_default_prefers_local_replicas():
@@ -181,10 +191,10 @@ def test_placement_commit_refreshes_policy_state():
     assert torch.equal(
         snapshot.logical_to_physical_candidates, rt._logical_to_physical_map[0]
     )
-    assert (
-        rt.replica_shares(logical, torch.rand(NUM_TOKENS, TOPK), state, None)
-        is not None
+    shares, ids = rt.resolve_routing(
+        logical, torch.rand(NUM_TOKENS, TOPK), state, None
     )
+    assert (shares is None) != (ids is None)
 
 
 def test_capabilities_gate_the_work_the_framework_does():

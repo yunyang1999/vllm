@@ -262,6 +262,22 @@ class MlbRoutingRuntime:
         # invasive, so it is off unless asked for -- diagnostic only.
         # Set by replica_shares when a policy answered with ids rather than a
         # share table; read by resolve_routing in the same call.
+        # The policy turns its own decision into per-token ids. Its sampler and
+        # the fused kernel draw identically -- same constant, same arithmetic,
+        # verified element for element -- so this places work rather than
+        # changing behaviour, and the two arms measure 20.44 against 20.43
+        # K tok/s end to end.
+        #
+        # What it buys is one implementation of the step instead of two, and
+        # the same path the SGLang adapter has always taken. It also removes
+        # the need for the two sides to agree on what a column of a share table
+        # means: a table built over a collapsed candidate list and resolved
+        # against an uncollapsed map sent the ranks holding a local replica
+        # away from it, silently, and that whole class of mismatch has no
+        # foothold once ids cross the boundary already resolved.
+        #
+        # MLB_KERNEL_APPLIES=1 restores the share-table path for comparison.
+        self._defer_dispatch = os.environ.get("MLB_KERNEL_APPLIES") == "1"
         self._last_physical_ids: torch.Tensor | None = None
         self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
         self._l2_us: list[float] = []
@@ -598,11 +614,13 @@ class MlbRoutingRuntime:
                 layer_id=layer_id,
                 logical_topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                placement=self._snapshot(layer_state, layer_id, defer_dispatch=True),
+                placement=self._snapshot(
+                    layer_state, layer_id, defer_dispatch=self._defer_dispatch
+                ),
                 stage=_current_stage(),
                 token_count=num_unpadded_tokens,
                 routed_scaling_factor=routed_scaling_factor,
-                defer_dispatch=True,
+                defer_dispatch=self._defer_dispatch,
                 global_logical_count=global_count,
             )
         )
