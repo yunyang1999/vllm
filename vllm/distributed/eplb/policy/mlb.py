@@ -52,10 +52,9 @@ class MlbEplbPolicy(AbstractEplbPolicy):
         old_global_expert_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         try:
-            from moe_load_balancer import MoELoadBalancer
-            from moe_load_balancer.adapters.vllm import (
-                to_placement_request,
-                to_vllm_physical_to_logical,
+            from vllm.distributed.eplb.mlb_runtime import (
+                placement_request,
+                plan_placement,
             )
         except ImportError as exc:  # pragma: no cover - depends on environment
             raise ImportError(
@@ -68,7 +67,7 @@ class MlbEplbPolicy(AbstractEplbPolicy):
 
         # vLLM passes num_groups=0 for models without expert groups; MLB
         # expresses "no grouping" as a single group.
-        request = to_placement_request(
+        request = placement_request(
             weight.float().cpu(),
             num_replicas=num_replicas,
             num_ranks=num_ranks,
@@ -82,8 +81,11 @@ class MlbEplbPolicy(AbstractEplbPolicy):
             ),
         )
 
-        plan = MoELoadBalancer().plan_placement(request)
-        phy2log = to_vllm_physical_to_logical(plan).cpu().to(torch.int64)
+        # The engine's balancer, not a fresh one per rebalance: L1 and L2 must
+        # be the same instance for any policy whose placement depends on what
+        # routing observed.
+        phy2log, plan = plan_placement(request)
+        phy2log = phy2log.cpu().to(torch.int64)
 
         # MLB's L1 policies do not consume a previous placement, so the
         # slot-preservation pass that the built-in policy performs inside

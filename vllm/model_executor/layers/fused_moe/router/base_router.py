@@ -28,6 +28,7 @@ if current_platform.is_cuda_alike():
         record_enabled_ptr,
         num_unpadded_tokens_ptr,
         replica_prob_ptr,
+        physical_ids_ptr,
         num_logical_experts,
         map_slots,
         out_size,
@@ -35,6 +36,7 @@ if current_platform.is_cuda_alike():
         num_active_experts,
         HAS_NUM_UNPADDED: tl.constexpr,
         HAS_REPLICA_PROB: tl.constexpr,
+        HAS_PHYSICAL_IDS: tl.constexpr,
         PROB_SLOTS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
@@ -87,12 +89,21 @@ if current_platform.is_cuda_alike():
             # pick rather than collapsing every token onto replica 0.
             replica_idx = tl.where(total > 0.0, sampled, replica_idx)
 
-        map_index = safe_expert_id * map_slots + replica_idx
-        physical_id = tl.load(
-            logical_to_physical_ptr + map_index,
-            mask=mask & valid_expert,
-            other=-1,
-        )
+        if HAS_PHYSICAL_IDS:
+            # The policy resolved the replica itself. Selection and mapping are
+            # skipped; recording below is not, which is the whole reason this
+            # path exists rather than the caller writing out_ids and losing the
+            # load accounting that shares this kernel.
+            physical_id = tl.load(
+                physical_ids_ptr + offs, mask=mask & valid_expert, other=-1
+            ).to(tl.int64)
+        else:
+            map_index = safe_expert_id * map_slots + replica_idx
+            physical_id = tl.load(
+                logical_to_physical_ptr + map_index,
+                mask=mask & valid_expert,
+                other=-1,
+            )
         tl.store(out_ids_ptr + offs, physical_id, mask=mask)
 
         # 2. Record expert load metrics.
@@ -134,6 +145,7 @@ if current_platform.is_cuda_alike():
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None,
         replica_prob: torch.Tensor | None = None,
+        physical_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         topk_ids_in = topk_ids.contiguous().to(dtype=torch.int32)
         numel = topk_ids_in.numel()
@@ -168,6 +180,16 @@ if current_platform.is_cuda_alike():
                 map_slots,
             )
             replica_prob = replica_prob.contiguous().to(torch.float32)
+        if physical_ids is not None:
+            assert physical_ids.shape == topk_ids.shape, (
+                "resolved physical ids must match the TopK shape: "
+                f"{tuple(physical_ids.shape)} vs {tuple(topk_ids.shape)}"
+            )
+            physical_ids = physical_ids.contiguous().to(torch.int32)
+            logger.info_once(
+                "MLB direct-dispatch routing active: the policy resolves "
+                "replicas itself; load recording stays in this kernel"
+            )
         _eplb_map_and_record_i32_kernel[grid](
             topk_ids_in,
             logical_replica_count.contiguous(),
@@ -177,6 +199,7 @@ if current_platform.is_cuda_alike():
             record_enabled,
             num_unpadded_tokens,
             replica_prob,
+            physical_ids,
             logical_replica_count.shape[0],
             map_slots,
             expert_load_view.shape[0],
@@ -184,6 +207,7 @@ if current_platform.is_cuda_alike():
             num_active_experts,
             HAS_NUM_UNPADDED=num_unpadded_tokens is not None,
             HAS_REPLICA_PROB=replica_prob is not None,
+            HAS_PHYSICAL_IDS=physical_ids is not None,
             PROB_SLOTS=prob_slots,
             BLOCK_SIZE=256,
         )
@@ -206,6 +230,7 @@ if current_platform.is_cuda_alike():
         # which means load recording, the record gate and the padding mask all
         # stay exactly as they are, with nothing reimplemented alongside them.
         replica_prob = None
+        physical_ids = None
         if layer_state is not None and topk_weights is not None:
             from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
 
@@ -213,7 +238,7 @@ if current_platform.is_cuda_alike():
             # The policy itself declares whether it wants the routing boundary;
             # a pipeline with no post-TopK stage leaves the fused kernel alone.
             if routing is not None and routing.requires_post_topk_routing:
-                replica_prob = routing.replica_shares(
+                replica_prob, physical_ids = routing.resolve_routing(
                     topk_ids, topk_weights, layer_state, num_unpadded_tokens
                 )
 
@@ -226,6 +251,7 @@ if current_platform.is_cuda_alike():
             record_enabled=record_enabled,
             num_unpadded_tokens=num_unpadded_tokens,
             replica_prob=replica_prob,
+            physical_ids=physical_ids,
         )
 else:
 

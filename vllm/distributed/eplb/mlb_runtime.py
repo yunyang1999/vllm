@@ -28,6 +28,7 @@ silently degrading:
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -117,6 +118,7 @@ class MlbRoutingRuntime:
         num_logical_experts: int,
         num_physical_experts: int,
         physical_to_logical_map: torch.Tensor,
+        balancer: object | None = None,
     ) -> None:
         from moe_load_balancer import MoELoadBalancer
 
@@ -142,7 +144,10 @@ class MlbRoutingRuntime:
             ep_size,
             device=physical_to_logical_map.device,
         )
-        self._mlb = MoELoadBalancer.from_algorithm(
+        # Injected when an engine-scoped integration owns the balancer, so L1
+        # and L2 are served by one instance rather than two that cannot see
+        # each other.
+        self._mlb = balancer if balancer is not None else MoELoadBalancer.from_algorithm(
             algorithm,
             ep_size=ep_size,
             source_rank=ep_rank,
@@ -158,6 +163,18 @@ class MlbRoutingRuntime:
         self.requires_post_topk_routing = caps.requires_post_topk_routing
         self.requires_placement_state = caps.requires_placement_state
         self.requires_rank_dispatch_map = caps.requires_rank_dispatch_map
+        # Declared by the pipeline rather than inferred from "has a post-TopK
+        # policy": a replica policy can route from placement alone, and
+        # gathering the EP-wide load for it costs a collective per step that is
+        # then discarded.
+        self.consumes_global_logical_count = getattr(
+            caps, "consumes_global_logical_count", caps.requires_post_topk_routing
+        )
+        self.max_input_staleness_steps = getattr(caps, "max_input_staleness_steps", 0)
+        self.supports_concurrent_microbatches = getattr(
+            caps, "supports_concurrent_microbatches", False
+        )
+        self.graph_stability = getattr(caps, "graph_stability", "stable")
         logger.info(
             "MLB L2 routing enabled (algorithm=%s, ep_size=%d, logical=%d, "
             "physical=%d, caps: post_topk=%s placement_state=%s "
@@ -182,9 +199,9 @@ class MlbRoutingRuntime:
         # The fix: split "compute local count" (CUDA kernel, graph-safe) from
         # "all_reduce" (outside the graph, once per step).
         #
-        # _lplb_local_count[layer, expert]: local counts accumulated per-layer
+        # _logical_count_local[layer, expert]: local counts accumulated per-layer
         #   inside the graph by count_logical_experts; reset each step.
-        # _lplb_global_count[layer, expert]: all-reduced result of the previous
+        # _logical_count_global[layer, expert]: all-reduced result of the previous
         #   step, stable GPU address, read by LP solve inside the graph.
         #
         # The LP solve therefore uses counts stale by one step, which is an
@@ -204,21 +221,21 @@ class MlbRoutingRuntime:
         # cost of that discarded work can be measured against this, rather than
         # only argued for.
         keep_degenerate = os.environ.get("MLB_KEEP_ZERO_REDUNDANCY_COUNTS") == "1"
-        if self.requires_post_topk_routing and (
+        if self.consumes_global_logical_count and (
             self._max_replicas > 1 or keep_degenerate
         ):
-            self._lplb_local_count: torch.Tensor | None = torch.zeros(
+            self._logical_count_local: torch.Tensor | None = torch.zeros(
                 num_moe_layers, num_logical_experts, dtype=torch.float32, device=dev
             )
-            self._lplb_global_count: torch.Tensor | None = torch.zeros(
+            self._logical_count_global: torch.Tensor | None = torch.zeros(
                 num_moe_layers, num_logical_experts, dtype=torch.float32, device=dev
             )
         else:
-            self._lplb_local_count = None
-            self._lplb_global_count = None
+            self._logical_count_local = None
+            self._logical_count_global = None
         # True once finalize_step_counts has run at least once (first step uses
         # zeros → hash routing fallback via selection is None).
-        self._lplb_count_initialized = False
+        self._logical_count_ready = False
 
         # MLB_FRESH_COUNTS=1 withholds the pre-computed count so MLB gathers it
         # itself, per layer per forward. That is what the SGLang adapter does and
@@ -231,20 +248,38 @@ class MlbRoutingRuntime:
         # replica_shares runs per layer per forward.
         self._fresh_counts = os.environ.get("MLB_FRESH_COUNTS") == "1"
 
+        # Diagnostic capture of the LP's inputs and output. Off unless a
+        # directory is named; bounded so a long run cannot fill the disk.
+        self._dump_lp_dir = os.environ.get("MLB_DUMP_LP") or None
+        self._dump_lp_left = int(os.environ.get("MLB_DUMP_LP_N", "120"))
+        # Skip the opening calls: the first steps legitimately carry zeros
+        # while the one-step-stale pipeline fills, and sampling only those
+        # would mistake a warm-up transient for steady state.
+        self._dump_lp_skip = int(os.environ.get("MLB_DUMP_LP_SKIP", "0"))
+
+        # MLB_TIME_L2=<n> times n route_tokens calls with a device sync on each
+        # side. The sync makes the number meaningful and the measurement
+        # invasive, so it is off unless asked for -- diagnostic only.
+        # Set by replica_shares when a policy answered with ids rather than a
+        # share table; read by resolve_routing in the same call.
+        self._last_physical_ids: torch.Tensor | None = None
+        self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
+        self._l2_us: list[float] = []
+
     def finalize_step_counts(self) -> None:
         """All-reduce per-layer local counts and update the stable LP input buffer.
 
         Call at the START of each forward pass (from EplbState.prepare_forward).
         By the time this runs, the previous step's count_logical_experts results
-        are already in _lplb_local_count (written per-layer inside the graph or
+        are already in _logical_count_local (written per-layer inside the graph or
         in the eager forward).
 
         One EP collective for all 40 layers combined replaces the 40 per-layer
         collectives that MLB's _global_logical_count would otherwise issue.
         Running outside the graph means NCCL is never captured -- graphs only
-        see the LP solve kernels reading from _lplb_global_count.
+        see the LP solve kernels reading from _logical_count_global.
         """
-        if self._lplb_local_count is None or self._lplb_global_count is None:
+        if self._logical_count_local is None or self._logical_count_global is None:
             return
         # Never run inside a CUDA graph capture stream.  prepare_forward is
         # normally called outside graph context, but guard explicitly.
@@ -252,15 +287,20 @@ class MlbRoutingRuntime:
             return
         from vllm.distributed import get_ep_group
         ep_group = get_ep_group()
-        ep_group.all_reduce(self._lplb_local_count)
-        self._lplb_global_count.copy_(self._lplb_local_count)
-        self._lplb_local_count.zero_()
-        self._lplb_count_initialized = True
+        ep_group.all_reduce(self._logical_count_local)
+        self._logical_count_global.copy_(self._logical_count_local)
+        self._logical_count_local.zero_()
+        self._logical_count_ready = True
 
     def set_physical_to_logical_map(self, mapping: torch.Tensor) -> None:
         self.physical_to_logical_map = mapping
 
-    def _snapshot(self, layer_state: EplbLayerState, layer_id: int) -> Any:
+    def _snapshot(
+        self,
+        layer_state: EplbLayerState,
+        layer_id: int,
+        defer_dispatch: bool = False,
+    ) -> Any:
         from moe_load_balancer.adapters.vllm import (
             collapse_candidates_to_local,
             to_placement_snapshot,
@@ -291,7 +331,15 @@ class MlbRoutingRuntime:
         # it changes no decision.
         candidates = layer_state.logical_to_physical_map[:, : self._max_replicas]
         counts = layer_state.logical_replica_count
-        if self.requires_rank_dispatch_map:
+        # Only collapse when the policy hands back per-token ids. The share
+        # table's column j is resolved against *vLLM's* candidate map, which is
+        # never collapsed, so a table built over a collapsed list means
+        # something different on the two sides: column 0 is this rank's local
+        # replica to the policy and the globally-first replica to the kernel.
+        # The ranks that own a copy are then routed away from it -- worse than
+        # the uniform choice being replaced. A local preference belongs in the
+        # probabilities, not in a shortened candidate list.
+        if self.requires_rank_dispatch_map and not defer_dispatch:
             candidates, counts = collapse_candidates_to_local(
                 candidates,
                 counts,
@@ -422,9 +470,19 @@ class MlbRoutingRuntime:
         (``ModelRunner._notify_mlb_placement_committed``); vLLM does not track
         them, so Glue diffs the maps before committing and passes the result.
         """
+        # The nearest-replica table is *this* side's derived state, not the
+        # policy's, so it is refreshed on every commit. Gating it on
+        # requires_placement_state left a policy that keeps no state of its
+        # own -- static, which reads this table and nothing else -- routing
+        # by the placement the run started with. After a rearrangement most
+        # defaults are no longer in their expert's candidate list, the share
+        # table falls back to column 0 for them, and the traffic those
+        # replicas exist to spread lands on one of them.
+
+        self._rebuild_default_replicas()
+
         if not self.requires_placement_state:
             return
-        self._rebuild_default_replicas()
         if changed_layer_ids is None:
             changed_layer_ids = list(range(self._logical_to_physical_map.shape[0]))
         if not changed_layer_ids:
@@ -435,6 +493,26 @@ class MlbRoutingRuntime:
             len(changed_layer_ids),
             self._logical_to_physical_map.shape[0],
         )
+
+    def resolve_routing(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        layer_state: EplbLayerState,
+        num_unpadded_tokens: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Ask MLB to route, in whichever form the policy answered.
+
+        Returns ``(replica_shares, physical_ids)`` with at most one set. A
+        policy that splits an expert's traffic answers with a share table and
+        lets the caller apply it; a policy that picks per token answers with
+        ids. Supporting only the first is what made ``static`` and ``dynamic``
+        appear to do nothing on this runtime.
+        """
+        shares = self.replica_shares(
+            topk_ids, topk_weights, layer_state, num_unpadded_tokens
+        )
+        return shares, (None if shares is not None else self._last_physical_ids)
 
     def replica_shares(
         self,
@@ -463,14 +541,11 @@ class MlbRoutingRuntime:
         reads it when materializing a shared-expert decision, and vLLM's CUDA
         path has no shared-expert dispatch to materialize.
         """
-        # First step: global count buffer is zero-initialised (no real data yet).
-        # Return None → hash routing until finalize_step_counts has run once.
-        if not self._lplb_count_initialized:
-            return None
 
         from moe_load_balancer.adapters.vllm import to_routing_request
         from moe_load_balancer.kernels.expert_count import count_logical_experts
 
+        self._last_physical_ids = None
         layer_id = layer_state.moe_layer_idx
         if layer_id is None:
             raise RuntimeError(
@@ -478,15 +553,27 @@ class MlbRoutingRuntime:
                 "was registered by a path that does not set it."
             )
 
-        # Accumulate LOCAL count for this layer into the stable buffer.
-        # Skip during Dynamo tracing: count_logical_experts_cuda is a custom
-        # CUDA kernel that Dynamo may not handle.  During actual execution
-        # (graph capture or eager) it runs normally and is captured into the
-        # CUDA graph along with the copy_.  On replay, the captured kernels
-        # re-execute with fresh topk_ids and update _lplb_local_count.
-        if self._lplb_local_count is not None and not torch._dynamo.is_compiling():
+        # Accumulate this layer's LOCAL count into the stable buffer. Skipped
+        # during Dynamo tracing, where the counting kernel may not be handled;
+        # under graph capture and eager it runs normally and is captured
+        # alongside the copy_.
+        #
+        # This happens BEFORE the readiness check below, not after it. With the
+        # write on the far side, the opening step returned early without
+        # recording anything, the next step's reduction still saw zeros, and the
+        # solve after that was the first to meet real data -- a three-step
+        # warm-up where the design calls for two, leaving one step of every run
+        # solving against an all-zero load.
+        if self._logical_count_local is not None and not torch._dynamo.is_compiling():
             local = count_logical_experts(topk_ids, self.num_logical_experts)
-            self._lplb_local_count[layer_id].copy_(local)
+            self._logical_count_local[layer_id].copy_(local)
+
+        # Only policies that read the load have to wait for it. Gating every
+        # policy on this readiness flag disabled the ones that never asked for
+        # a count: their buffers are not allocated, so the flag never flips and
+        # they returned None for the lifetime of the run.
+        if self.consumes_global_logical_count and not self._logical_count_ready:
+            return None
 
         # Pass the PREVIOUS step's global count to MLB.  The stable tensor
         # slice has a fixed GPU address, so it is safe to use inside a
@@ -496,18 +583,22 @@ class MlbRoutingRuntime:
             None
             if self._fresh_counts
             else (
-                self._lplb_global_count[layer_id]
-                if self._lplb_global_count is not None
+                self._logical_count_global[layer_id]
+                if self._logical_count_global is not None
                 else None
             )
         )
+
+        if self._time_l2:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
 
         decision = self._mlb.route_tokens(
             to_routing_request(
                 layer_id=layer_id,
                 logical_topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                placement=self._snapshot(layer_state, layer_id),
+                placement=self._snapshot(layer_state, layer_id, defer_dispatch=True),
                 stage=_current_stage(),
                 token_count=num_unpadded_tokens,
                 routed_scaling_factor=routed_scaling_factor,
@@ -515,11 +606,197 @@ class MlbRoutingRuntime:
                 global_logical_count=global_count,
             )
         )
+        if self._time_l2:
+            torch.cuda.synchronize()
+            self._l2_us.append((time.perf_counter() - _t0) * 1e6)
+            if len(self._l2_us) >= self._time_l2:
+                import statistics
+
+                logger.info(
+                    "MLB L2 solve cost: n=%d  median=%.0f us  p90=%.0f us  "
+                    "mean=%.0f us",
+                    len(self._l2_us), statistics.median(self._l2_us),
+                    sorted(self._l2_us)[int(0.9 * len(self._l2_us))],
+                    statistics.mean(self._l2_us),
+                )
+                self._l2_us.clear()
+                self._time_l2 = 0
+
         selection = decision.metadata.get("replica_selection")
         if selection is None:
+            # The contract's primary return is per-token physical ids; the
+            # share table is the alternative a fused runtime asks for. A policy
+            # that answers with ids has decided, and dropping that answer here
+            # is what silently turned such policies into no-ops.
+            ids = decision.routed_physical_topk_ids
+            if ids is None or ids is topk_ids:
+                return None
+            self._last_physical_ids = ids
             return None
+
+        # MLB_DUMP_LP=<dir> captures what the solve was given and what it
+        # returned, so the achievable headroom can be computed offline instead
+        # of inferred from end-to-end throughput. Diagnostic only.
+        if self._dump_lp_skip > 0:
+            self._dump_lp_skip -= 1
+        elif self._dump_lp_dir is not None and self._dump_lp_left > 0:
+            import os as _os
+
+            self._dump_lp_left -= 1
+            torch.save(
+                {
+                    "layer_id": layer_id,
+                    "ep_size": self.ep_size,
+                    "num_local": self.num_physical_experts // self.ep_size,
+                    "candidates": layer_state.logical_to_physical_map[
+                        :, : self._max_replicas
+                    ].cpu(),
+                    "counts": layer_state.logical_replica_count.cpu(),
+                    "global_count": (
+                        None if global_count is None else global_count.float().cpu()
+                    ),
+                    "probability": selection.probability.float().cpu(),
+                },
+                _os.path.join(
+                    self._dump_lp_dir,
+                    f"lp_r{self.ep_rank}_l{layer_id}_{self._dump_lp_left}.pt",
+                ),
+            )
         return selection.probability
 
+
+
+class VllmMlbIntegration:
+    """One balancer per engine, serving both placement and routing.
+
+    SGLang gives an engine a single MoELoadBalancer and lets L1 and L2 share
+    it. vLLM did not: the L1 policy built a throwaway instance on every
+    rebalance and L2 held a second one in a module global. Two instances cannot
+    see each other's state, which rules out any policy whose placement decision
+    depends on what routing observed -- the premise of the predictive layer --
+    and a module global also rules out more than one engine in a process.
+
+    The lookup below stays module-level because vLLM's placement policy is a
+    classmethod with nowhere to hang an instance. Ownership is not: the
+    integration is created and released by EplbState, so its lifetime is the
+    engine's.
+    """
+
+    def __init__(self, algorithm: str = "") -> None:
+        from moe_load_balancer import MoELoadBalancer
+
+        self.algorithm = algorithm
+        self._balancer_kwargs: dict | None = None
+        self._balancer = None if algorithm else MoELoadBalancer()
+        self.routing: MlbRoutingRuntime | None = None
+
+    def balancer(self):
+        """The single MoELoadBalancer this engine uses."""
+        if self._balancer is None:
+            from moe_load_balancer import MoELoadBalancer
+
+            if self._balancer_kwargs is None:
+                # Placement can be asked for before the routing geometry is
+                # known; a plain planner answers L1 and is replaced in place
+                # once routing supplies the topology.
+                self._balancer = MoELoadBalancer()
+            else:
+                self._balancer = MoELoadBalancer.from_algorithm(
+                    self.algorithm, **self._balancer_kwargs
+                )
+        return self._balancer
+
+    def bind_routing(self, **kwargs) -> MlbRoutingRuntime:
+        """Create the routing runtime against this engine's balancer."""
+        from moe_load_balancer import MoELoadBalancer
+
+        self._balancer_kwargs = {
+            "ep_size": kwargs["ep_size"],
+            "source_rank": kwargs["ep_rank"],
+            "experts_per_rank": kwargs["num_physical_experts"] // kwargs["ep_size"],
+            "collectives": VllmRoutingCollectives(),
+        }
+        self._balancer = MoELoadBalancer.from_algorithm(
+            self.algorithm, **self._balancer_kwargs
+        )
+        self.routing = MlbRoutingRuntime(
+            self.algorithm, balancer=self._balancer, **kwargs
+        )
+        return self.routing
+
+
+_integration: VllmMlbIntegration | None = None
+
+
+def get_mlb_integration() -> VllmMlbIntegration:
+    """The engine's integration, created on first use."""
+    global _integration
+    if _integration is None:
+        _integration = VllmMlbIntegration(mlb_l2_algorithm())
+    return _integration
+
+
+def set_mlb_integration(integration: VllmMlbIntegration | None) -> None:
+    global _integration, _runtime
+    _integration = integration
+    _runtime = None if integration is None else integration.routing
+
+
+def l2_pipeline_capabilities(algorithm: str):
+    """Capabilities the named L2 pipeline declares, or None if unknown.
+
+    Stateless, so it answers before any engine exists -- configuration
+    validation needs it. Living here rather than at each call site keeps the
+    balancer a detail of one module: everything else in vLLM asks this file.
+    """
+    if not algorithm:
+        return None
+    try:
+        from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+
+        return RoutingPipeline.from_value(algorithm).capabilities
+    except Exception:
+        return None
+
+
+def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | None:
+    """Why the named policy cannot act on this deployment, or None.
+
+    The reason is the policy's own words. vLLM replicates the shared expert
+    per rank and never dispatches it, which is what makes a shared-expert
+    policy inapplicable here whatever the redundancy -- a distinction the
+    policy draws, not one this side can assume.
+    """
+    if not algorithm:
+        return None
+    try:
+        from moe_load_balancer import DeploymentTopology
+        from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+
+        pipeline = RoutingPipeline.from_value(algorithm)
+    except Exception:
+        return None
+    return pipeline.is_applicable(
+        DeploymentTopology(
+            num_redundant_experts=num_redundant_experts,
+            routes_shared_expert=False,
+        )
+    )
+
+
+def plan_placement(request):
+    """Run L1 through the engine's balancer and hand back vLLM's one map."""
+    from moe_load_balancer.adapters.vllm import to_vllm_physical_to_logical
+
+    plan = get_mlb_integration().balancer().plan_placement(request)
+    return to_vllm_physical_to_logical(plan), plan
+
+
+def placement_request(*args, **kwargs):
+    """Translate vLLM's rebalance arguments into the neutral request."""
+    from moe_load_balancer.adapters.vllm import to_placement_request
+
+    return to_placement_request(*args, **kwargs)
 
 def _reject_graphs_with_rearranging_placement_state(rearranges: bool) -> None:
     """Refuse the one combination that can fault the GPU.
@@ -585,8 +862,9 @@ def init_mlb_routing(
     global _runtime
     if not algorithm:
         return None
-    _runtime = MlbRoutingRuntime(
-        algorithm,
+    integration = get_mlb_integration()
+    integration.algorithm = algorithm
+    _runtime = integration.bind_routing(
         ep_size=ep_size,
         ep_rank=ep_rank,
         num_logical_experts=num_logical_experts,
@@ -594,7 +872,11 @@ def init_mlb_routing(
         physical_to_logical_map=physical_to_logical_map,
     )
     _runtime.register_logical_maps(logical_to_physical_map, logical_replica_count)
-    if _runtime.requires_placement_state:
+    # Keyed on the declared stability of the policy's state, not on whether it
+    # keeps state at all. A policy whose placement-derived tensors keep their
+    # addresses across a rearrangement is safe to capture; refusing it because
+    # some other policy is not would bar a combination that never faults.
+    if _runtime.graph_stability == "realloc_on_placement_change":
         _reject_graphs_with_rearranging_placement_state(rearranges)
     return _runtime
 
@@ -604,6 +886,7 @@ def get_mlb_routing() -> MlbRoutingRuntime | None:
 
 
 def reset_mlb_routing() -> None:
-    """Test hook."""
-    global _runtime
+    """Test hook. Releases the engine's integration along with the runtime."""
+    global _runtime, _integration
     _runtime = None
+    _integration = None

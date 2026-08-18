@@ -1030,3 +1030,58 @@ def test_eplb_map_num_unpadded_tokens(
 
     exp_load = torch.tensor(expected_load, dtype=torch.int32, device="cuda")
     torch.testing.assert_close(load, exp_load)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_a_policy_may_resolve_replicas_itself_and_still_be_recorded():
+    """The contract's primary return is per-token physical ids.
+
+    A runtime that only accepts a share table forces every policy to express
+    its decision as a per-expert distribution, and silently ignores the ones
+    that cannot -- which is what made static and dynamic appear to do nothing
+    here. Taking the ids directly must still leave load recording in this
+    kernel, since that is the reason the boundary is inside it at all.
+    """
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        _eplb_map_and_record_triton,
+    )
+
+    torch.manual_seed(0)
+    num_logical, num_physical, ep = 8, 12, 2
+    tokens, topk = 32, 2
+    logical_to_physical = torch.full((num_logical, 2), -1, dtype=torch.int32, device="cuda")
+    logical_to_physical[:, 0] = torch.arange(num_logical, dtype=torch.int32, device="cuda")
+    logical_to_physical[:4, 1] = torch.arange(
+        num_logical, num_physical, dtype=torch.int32, device="cuda"
+    )
+    counts = torch.ones(num_logical, dtype=torch.int32, device="cuda")
+    counts[:4] = 2
+
+    topk_ids = torch.randint(
+        0, num_logical, (tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    # Resolve every token onto the *second* replica where one exists -- a choice
+    # the built-in hash would not make for every token, so the result is
+    # distinguishable from the fallback.
+    chosen = torch.where(
+        counts[topk_ids.long()] > 1,
+        logical_to_physical[topk_ids.long(), 1],
+        logical_to_physical[topk_ids.long(), 0],
+    ).to(torch.int32)
+
+    load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+    out = _eplb_map_and_record_triton(
+        topk_ids=topk_ids,
+        logical_to_physical_map=logical_to_physical,
+        logical_replica_count=counts,
+        expert_load_view=load,
+        record_enabled=torch.tensor(1, dtype=torch.int32, device="cuda"),
+        num_unpadded_tokens=None,
+        physical_ids=chosen,
+    )
+    assert torch.equal(out, chosen), "the policy's own ids must be used verbatim"
+    # Recording is the reason this path goes through the kernel rather than
+    # around it: every routed token must still land in the load view.
+    assert int(load.sum()) == tokens * topk
+    for pid in chosen.unique():
+        assert int(load[int(pid)]) == int((chosen == pid).sum())

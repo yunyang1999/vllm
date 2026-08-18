@@ -222,6 +222,13 @@ class EplbModelState:
     """
 
 
+
+# Layers committed by the async worker whose policy notification is still owed.
+# Written from the worker thread, drained on the main thread; set operations are
+# atomic under the GIL and a missed drain only defers by one forward.
+_ASYNC_COMMITTED_LAYERS: set[int] = set()
+
+
 class EplbState:
     """
     EplbState of each expert parallel model. Key is the model config hash.
@@ -530,18 +537,24 @@ class EplbState:
         # Read from the config rather than the environment: EPLBConfig resolves
         # $VLLM_MLB_L2_ALGORITHM once and clears it for placements the policy
         # cannot act on, so by here the answer already accounts for redundancy.
-        from vllm.distributed.eplb.mlb_runtime import init_mlb_routing
+        from vllm.distributed.eplb.mlb_runtime import (
+            init_mlb_routing,
+            l2_pipeline_capabilities,
+        )
 
         l2_algorithm = self.parallel_config.eplb_config.l2_algorithm
         if l2_algorithm:
             if self.parallel_config.num_ubatches > 1:
-                raise ValueError(
-                    "MoE Load Balancer L2 routing is incompatible with DBO: MLB's "
-                    "routing request carries a single token count and its "
-                    "policies keep one solver state per layer, so concurrent "
-                    "micro-batches would clobber each other. Disable DBO or "
-                    "clear eplb_config.l2_algorithm."
-                )
+                caps = l2_pipeline_capabilities(l2_algorithm)
+                if caps is not None and not caps.supports_concurrent_microbatches:
+                    raise ValueError(
+                        f"MoE Load Balancer L2 routing {l2_algorithm!r} is "
+                        "incompatible with DBO: it keeps one solver state per "
+                        "layer, and concurrent micro-batches would clobber each "
+                        "other. Disable DBO, or select a policy that declares "
+                        "supports_concurrent_microbatches. Clearing "
+                        "eplb_config.l2_algorithm also removes the conflict."
+                    )
             ep_group = get_ep_group()
             routing = init_mlb_routing(
                 algorithm=l2_algorithm,
@@ -631,6 +644,12 @@ class EplbState:
         from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
         routing = get_mlb_routing()
         if routing is not None:
+            # Deliver any placement changes the async worker committed since the
+            # last forward, on this thread, before anything routes against them.
+            if _ASYNC_COMMITTED_LAYERS:
+                pending = sorted(_ASYNC_COMMITTED_LAYERS)
+                _ASYNC_COMMITTED_LAYERS.clear()
+                routing.on_placement_committed(pending)
             routing.finalize_step_counts()
 
         model_state = self.model_states.get(compute_hash_cached(model_config))
@@ -1515,6 +1534,17 @@ def _move_to_workspace(
         new_physical_to_logical_map=result.new_physical_to_logical_map,
         layer=result.layer_idx,
     )
+
+    # A policy holding placement-derived state has to be told this layer moved,
+    # or it keeps solving against the layout the layer used to have: the
+    # decision stays a valid replica of the right expert, because the dispatch
+    # kernel clamps to the live count and reads the committed map, but the split
+    # it computes is the one that balanced the *previous* placement.
+    #
+    # The notification is queued rather than delivered here. This runs on the
+    # async worker thread, and rebuilding a policy's per-layer state does GPU
+    # work; the main thread drains the queue at the top of the next forward.
+    _ASYNC_COMMITTED_LAYERS.add(result.layer_idx)
 
     if result.layer_idx == model_state.model.num_moe_layers - 1:
         model_state.rebalanced = False

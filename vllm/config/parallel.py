@@ -55,6 +55,8 @@ All2AllBackend = Literal[
 ]
 
 
+
+
 @config
 class EPLBConfig:
     """Configuration for Expert Parallel Load Balancing (EP)."""
@@ -156,18 +158,29 @@ class EPLBConfig:
         # anything sizes buffers or declares capabilities against it. Output is
         # unaffected, which is what makes doing it silently unacceptable but
         # doing it at all safe.
-        if self.l2_algorithm and self.num_redundant_experts == 0:
-            logger.warning(
-                "Disabling MoE Load Balancer L2 routing (%r): it selects among "
-                "replicas of a logical expert, and num_redundant_experts=0 "
-                "leaves every logical expert with exactly one. Routing is "
-                "unchanged by this -- the policy could only have reproduced it "
-                "-- but the per-layer routing boundary and its load collective "
-                "are now skipped. Set eplb_config.num_redundant_experts > 0 to "
-                "give it something to balance.",
-                self.l2_algorithm,
+        if self.l2_algorithm:
+            from vllm.distributed.eplb.mlb_runtime import l2_inapplicable_reason
+
+            reason = l2_inapplicable_reason(
+                self.l2_algorithm, self.num_redundant_experts
             )
-            self.l2_algorithm = ""
+            if reason is not None:
+                # Deciding here rather than deeper down means nothing
+                # downstream ever sizes a buffer, publishes a capability or
+                # picks a graph mode against a policy that was never going to
+                # act. The reason comes from the balancer: which deployments a
+                # policy can work on is a property of the policy, and a
+                # framework that decides it by assumption will switch off a
+                # policy that had work to do.
+                logger.warning(
+                    "Disabling MoE Load Balancer L2 routing (%r): %s. Routing "
+                    "is unchanged by this -- the policy could only have "
+                    "reproduced it -- but the per-layer routing boundary and "
+                    "any load collective it needed are now skipped.",
+                    self.l2_algorithm,
+                    reason,
+                )
+                self.l2_algorithm = ""
 
         return self
 
