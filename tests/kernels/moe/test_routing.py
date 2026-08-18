@@ -1085,3 +1085,57 @@ def test_a_policy_may_resolve_replicas_itself_and_still_be_recorded():
     assert int(load.sum()) == tokens * topk
     for pid in chosen.unique():
         assert int(load[int(pid)]) == int((chosen == pid).sum())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_policy_resolved_ids_stay_valid_and_fully_recorded():
+    """Whatever a policy hands back, two things must still hold.
+
+    Every id has to name a live replica of the expert the router chose -- the
+    policy replaces the selection, not the routing decision -- and the load
+    view has to account for every routed slot, since recording is the reason
+    resolved ids come through this kernel rather than around it.
+    """
+    torch.manual_seed(0)
+    NL, NP, EP = 64, 80, 8
+    per_rank = NP // EP
+    l2p = torch.full((NL, 2), -1, dtype=torch.int32, device="cuda")
+    l2p[:, 0] = torch.arange(NL, dtype=torch.int32, device="cuda")
+    l2p[:16, 1] = torch.arange(NL, NP, dtype=torch.int32, device="cuda")
+    counts = torch.ones(NL, dtype=torch.int32, device="cuda")
+    counts[:16] = 2
+    topk = torch.randint(0, NL, (2048, 6), dtype=torch.int32, device="cuda")
+
+    # Pin every expert to the replica nearest rank 3 -- a decision the built-in
+    # hash would not make, so a fallback would be visible.
+    from moe_load_balancer.adapters.vllm import nearest_replica_table
+
+    defaults = nearest_replica_table(
+        l2p.to(torch.int64), counts.to(torch.int64),
+        ep_rank=3, num_local_physical_experts=per_rank,
+    ).to(torch.int32)
+    resolved = defaults[topk.to(torch.int64)]
+
+    load = torch.zeros(NP, dtype=torch.int32, device="cuda")
+    out = _eplb_map_and_record_triton(
+        topk_ids=topk, logical_to_physical_map=l2p, logical_replica_count=counts,
+        expert_load_view=load,
+        record_enabled=torch.tensor(1, dtype=torch.int32, device="cuda"),
+        num_unpadded_tokens=None, physical_ids=resolved,
+    )
+    assert torch.equal(out, resolved), "the policy's ids were not used verbatim"
+
+    # Each id names a replica of the right logical expert.
+    logical_of = torch.full((NP,), -1, dtype=torch.int32, device="cuda")
+    for j in range(2):
+        col = l2p[:, j]
+        live = col >= 0
+        logical_of[col[live].to(torch.int64)] = torch.arange(
+            NL, dtype=torch.int32, device="cuda"
+        )[live]
+    assert torch.equal(logical_of[out.to(torch.int64)], topk)
+
+    # And every routed slot is accounted for, slot by slot.
+    assert int(load.sum()) == topk.numel()
+    expected = torch.bincount(out.flatten().to(torch.int64), minlength=NP)
+    assert torch.equal(load.to(torch.int64), expected)
