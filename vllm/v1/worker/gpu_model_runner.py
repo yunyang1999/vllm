@@ -6213,6 +6213,27 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            # A routing policy that reads the EP-wide logical count issues one
+            # collective per forward, and prepare_forward -- where that
+            # collective lives on the real path -- is not called here. Under DP
+            # every rank must run a forward every step, so a rank with no
+            # requests runs this dummy batch while its peers run real ones.
+            # Issuing the collective on only one of those two paths leaves the
+            # EP group out of order: a peer's all_reduce meets this rank's next
+            # dispatch and both wait until DeepEP's CPU-recv timeout fires.
+            # Upstream already replays eplb_step here for the same reason.
+            #
+            # Only the collective is replayed. prepare_forward also drains
+            # async placement commits (rank-local, so asymmetry there cannot
+            # deadlock) and fills the unpadded-token tensors, which a dummy
+            # batch has no use for.
+            if self.eplb_state is not None:
+                from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+
+                routing = get_mlb_routing()
+                if routing is not None:
+                    routing.finalize_step_counts()
+
             with (
                 self.maybe_randomize_inputs(
                     input_ids, inputs_embeds, randomize_inputs=randomize_inputs
