@@ -142,6 +142,9 @@ if current_platform.is_cuda_alike():
         safe_physical_id = tl.where(physical_id >= 0, physical_id, 0)
         tl.atomic_add(out_ptr + safe_physical_id, 1, mask=valid)
 
+    # Passed as record_enabled when the policy already counted this layer.
+    _RECORD_OFF = torch.zeros((), dtype=torch.int32)
+
     def _eplb_map_and_record_triton(
         topk_ids: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
@@ -236,6 +239,7 @@ if current_platform.is_cuda_alike():
         # stay exactly as they are, with nothing reimplemented alongside them.
         replica_prob = None
         physical_ids = None
+        already_recorded = False
         if layer_state is not None and topk_weights is not None:
             from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
 
@@ -246,6 +250,12 @@ if current_platform.is_cuda_alike():
                 replica_prob, physical_ids = routing.resolve_routing(
                     topk_ids, topk_weights, layer_state, num_unpadded_tokens
                 )
+                # A policy that resolved ids may also have counted them while
+                # it was already visiting every slot. Counting again here would
+                # double every token in the view the next placement is planned
+                # from, so the second pass drops the recording and only maps.
+                if physical_ids is not None and routing.recorded_load:
+                    already_recorded = True
 
         # Fused triton implementation: mapping + optional recording in one kernel.
         return _eplb_map_and_record_triton(
@@ -253,7 +263,11 @@ if current_platform.is_cuda_alike():
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count,
             expert_load_view=expert_load_view,
-            record_enabled=record_enabled,
+            record_enabled=(
+                _RECORD_OFF.to(record_enabled.device)
+                if already_recorded
+                else record_enabled
+            ),
             num_unpadded_tokens=num_unpadded_tokens,
             replica_prob=replica_prob,
             physical_ids=physical_ids,
