@@ -399,6 +399,11 @@ class MlbRoutingRuntime:
                     num_local_physical_experts=(
                         self.num_physical_experts // self.ep_size
                     ),
+                    # Passed rather than inferred: inference reads the largest
+                    # physical id present, which undercounts whenever the top
+                    # ranks hold no replica, and this rank can then fall outside
+                    # the table it just built.
+                    ep_size=self.ep_size,
                 )
                 for layer in range(self._logical_to_physical_map.shape[0])
             ]
