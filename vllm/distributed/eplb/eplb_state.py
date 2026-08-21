@@ -737,16 +737,31 @@ class EplbState:
                 avg_tokens, max_tokens = tokens_tensors
                 balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
 
+                # The figure above reduces over dim 0, which is layers, so it
+                # reports how much a rank's load varies between its own layers.
+                # A balancer acts on something else: how far the busiest rank
+                # is from the average *within a layer*, since a layer's MoE
+                # step ends when its slowest rank does. Reported alongside
+                # rather than instead, so a number that has been quoted before
+                # keeps meaning what it did.
+                per_layer_mean = num_tokens_per_rank.mean(dim=1)
+                per_layer_peak = num_tokens_per_rank.max(dim=1).values
+                rank_imbalance = float(
+                    (per_layer_peak / per_layer_mean.clamp(min=1e-9)).mean()
+                )
+
                 if ep_group.rank() == 0:
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
                         "max_tokens=%d, balancedness=%.4f, "
+                        "rank_imbalance=%.4f, "
                         "steps until the next rearrangement: %d",
                         self.expert_rearrangement_step,
                         eplb_model_state.model_name,
                         avg_tokens,
                         max_tokens,
                         balancedness,
+                        rank_imbalance,
                         self.expert_rearrangement_step_interval
                         - self.expert_rearrangement_step,
                     )
