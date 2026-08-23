@@ -149,3 +149,55 @@ def test_recording_still_happens_on_the_share_path():
     assert torch.equal(
         load, torch.bincount(out.reshape(-1).long(), minlength=NUM_PHYSICAL)
     )
+
+
+def test_matching_the_collective_does_not_publish_zero_counts():
+    """A dummy forward must not wipe the counts a real one just published.
+
+    `finalize_step_counts` copies the per-layer local counts into the global
+    buffer the LP reads, then clears the local one. Running it a second time
+    within a step -- which is what a DP rank on a dummy batch does beside a peer
+    on a real batch -- copies the freshly cleared buffer over the published
+    counts. The solve then sees an all-zero load, produces an exactly uniform
+    split, and LPLB silently becomes `dynamic` while still paying for the solve.
+
+    That is not hypothetical: it is what shipped, and every LPLB measurement
+    taken before this fix was of a policy solving against zeros.
+
+    So the dummy path reduces a scratch tensor instead. This checks the counts
+    survive it.
+    """
+    import torch
+
+    from vllm.distributed.eplb.mlb_runtime import MlbRoutingRuntime
+
+    rt = MlbRoutingRuntime.__new__(MlbRoutingRuntime)
+    rt._logical_count_local = torch.zeros(2, 8)
+    rt._logical_count_global = torch.zeros(2, 8)
+    rt._logical_count_ready = False
+    rt._count_scratch = None
+
+    published = torch.tensor([[3.0, 1.0, 0, 0, 0, 0, 0, 0],
+                              [0, 2.0, 5.0, 0, 0, 0, 0, 0]])
+    rt._logical_count_local.copy_(published)
+
+    class _Group:
+        def all_reduce(self, t):  # single rank: reduction is identity
+            return t
+
+    import vllm.distributed as dist_mod
+
+    orig = dist_mod.get_ep_group
+    dist_mod.get_ep_group = lambda: _Group()
+    try:
+        rt.finalize_step_counts()
+        assert torch.equal(rt._logical_count_global, published)
+        # The dummy path runs next, in the same step.
+        rt.match_step_counts_collective()
+        assert torch.equal(rt._logical_count_global, published), (
+            "the dummy path overwrote the published counts; the solve would "
+            "see zeros and split uniformly"
+        )
+        assert rt._count_scratch is not None, "no collective was issued"
+    finally:
+        dist_mod.get_ep_group = orig

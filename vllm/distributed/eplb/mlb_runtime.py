@@ -236,6 +236,8 @@ class MlbRoutingRuntime:
         # True once finalize_step_counts has run at least once (first step uses
         # zeros → hash routing fallback via selection is None).
         self._logical_count_ready = False
+        # Reduced by the dummy path so the collective stays symmetric.
+        self._count_scratch: torch.Tensor | None = None
 
         # MLB_FRESH_COUNTS=1 withholds the pre-computed count so MLB gathers it
         # itself, per layer per forward. That is what the SGLang adapter does and
@@ -303,6 +305,31 @@ class MlbRoutingRuntime:
         self._logical_count_global.copy_(self._logical_count_local)
         self._logical_count_local.zero_()
         self._logical_count_ready = True
+
+    def match_step_counts_collective(self) -> None:
+        """Issue the count collective without touching the count pipeline.
+
+        A rank running a dummy batch has to take part in the collective, or the
+        EP group falls out of order and its peers wait in dispatch until DeepEP
+        times out. It must not run `finalize_step_counts`, though: that copies
+        the local buffer into the global one and then clears the local. Called a
+        second time within a step -- which is exactly what a dummy forward
+        beside a real one does -- it copies the freshly cleared buffer over the
+        counts that were just published, and the LP then solves against an
+        all-zero load for the rest of the run.
+
+        So the dummy path reduces a scratch tensor of the same shape instead:
+        same collective, same size, no effect on what the solve reads.
+        """
+        if self._logical_count_local is None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        from vllm.distributed import get_ep_group
+
+        if self._count_scratch is None:
+            self._count_scratch = torch.zeros_like(self._logical_count_local)
+        get_ep_group().all_reduce(self._count_scratch)
 
     def set_physical_to_logical_map(self, mapping: torch.Tensor) -> None:
         self.physical_to_logical_map = mapping
@@ -596,7 +623,6 @@ class MlbRoutingRuntime:
         if self._logical_count_local is not None and not torch._dynamo.is_compiling():
             local = count_logical_experts(topk_ids, self.num_logical_experts)
             self._logical_count_local[layer_id].copy_(local)
-
         # Only policies that read the load have to wait for it. Gating every
         # policy on this readiness flag disabled the ones that never asked for
         # a count: their buffers are not allocated, so the flag never flips and

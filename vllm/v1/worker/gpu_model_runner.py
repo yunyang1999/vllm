@@ -6232,7 +6232,11 @@ class GPUModelRunner(
 
                 routing = get_mlb_routing()
                 if routing is not None:
-                    routing.finalize_step_counts()
+                    # Not finalize_step_counts: that publishes the counts and
+                    # clears the local buffer, so running it here as well as on
+                    # the real path would overwrite the counts with zeros. This
+                    # only matches the collective.
+                    routing.match_step_counts_collective()
 
             with (
                 self.maybe_randomize_inputs(
