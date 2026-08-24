@@ -277,18 +277,8 @@ class MlbRoutingRuntime:
         # MLB_TIME_L2=<n> times n route_tokens calls with a device sync on each
         # side. The sync makes the number meaningful and the measurement
         # invasive, so it is off unless asked for -- diagnostic only.
-        # Set by replica_shares when a policy answered with ids rather than a
-        # share table; read by resolve_routing in the same call.
-        # Who realises the decision is the policy's to declare, not a
-        # deployment-wide switch. A policy whose choice is a per-expert
-        # distribution lets this runtime apply it in the one pass that also
-        # records load; a policy whose choice depends on the token resolves it
-        # and hands back ids, and only then can an L2 algorithm be something
-        # other than a distribution over replicas.
-        #
-        # The framework's own selection is untouched either way: with no policy
-        # configured the kernel picks by its built-in hash exactly as before.
-        self._defer_dispatch = not getattr(caps, "resolves_dispatch", False)
+        # Set by replica_shares when a policy answers with ids; read by
+        # resolve_routing in the same call.
         self._last_physical_ids: torch.Tensor | None = None
         # Whether the policy already accumulated this layer's load.
         self._last_recorded_load: bool = False
@@ -353,7 +343,6 @@ class MlbRoutingRuntime:
         self,
         layer_state: EplbLayerState,
         layer_id: int,
-        defer_dispatch: bool = False,
     ) -> Any:
         from moe_load_balancer.adapters.vllm import (
             collapse_candidates_to_local,
@@ -372,28 +361,22 @@ class MlbRoutingRuntime:
         # Applying it unconditionally answers the question LPLB exists to ask:
         # with a local replica always winning, a rank holding a copy has nothing
         # left to solve, so the LP is skipped outright and the rest see only the
-        # experts they do not host.  It also keeps the shares MLB returns
-        # indexable by vLLM's own `logical_to_physical_map` -- `replica_shares`
-        # passes on the probabilities alone, and their columns line up with that
-        # map only because the candidates handed to MLB are that map.
+        # experts they do not host.
         # vLLM pads the candidate map to MAX_EXPERT_REDUNDANCY + 1 (1024)
         # columns whatever the configured redundancy, and MLB answers with a
         # table the same width as the candidates it was given. The kernel scans
         # that table with a compile-time loop, so handing over the padded width
-        # is what made the share-table branch impossible to compile. Every
+        # would have made a share-table answer impossible to compile. Every
         # column past `_max_replicas` is padding on both sides, so trimming to
         # it changes no decision.
         candidates = layer_state.logical_to_physical_map[:, : self._max_replicas]
         counts = layer_state.logical_replica_count
-        # Only collapse when the policy hands back per-token ids. The share
-        # table's column j is resolved against *vLLM's* candidate map, which is
-        # never collapsed, so a table built over a collapsed list means
-        # something different on the two sides: column 0 is this rank's local
-        # replica to the policy and the globally-first replica to the kernel.
-        # The ranks that own a copy are then routed away from it -- worse than
-        # the uniform choice being replaced. A local preference belongs in the
-        # probabilities, not in a shortened candidate list.
-        if self.requires_rank_dispatch_map and not defer_dispatch:
+        # `requires_rank_dispatch_map` is true only for `static`, and static no
+        # longer calls this method at all -- its answer is resolved once per
+        # placement instead (see `dispatch_fixed_by_placement`). Kept rather
+        # than deleted: it is what a future rank-dispatch-map policy would need,
+        # and removing it now would be removing untested surface, not dead code.
+        if self.requires_rank_dispatch_map:
             candidates, counts = collapse_candidates_to_local(
                 candidates,
                 counts,
@@ -628,13 +611,13 @@ class MlbRoutingRuntime:
         layer_state: EplbLayerState,
         num_unpadded_tokens: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Ask MLB to route, in whichever form the policy answered.
+        """Ask MLB to route.
 
-        Returns ``(replica_shares, physical_ids)`` with at most one set. A
-        policy that splits an expert's traffic answers with a share table and
-        lets the caller apply it; a policy that picks per token answers with
-        ids. Supporting only the first is what made ``static`` and ``dynamic``
-        appear to do nothing on this runtime.
+        Returns ``(replica_shares, physical_ids)``. Every replica policy
+        resolves its own ids now, so the first element is always ``None`` --
+        kept in the return shape because the caller's fused kernel still has a
+        share-table mode (``HAS_REPLICA_PROB``) it did not stop supporting,
+        even though nothing on the MLB side asks for it any more.
         """
         shares = self.replica_shares(
             topk_ids, topk_weights, layer_state, num_unpadded_tokens
@@ -650,20 +633,12 @@ class MlbRoutingRuntime:
         num_unpadded_tokens: torch.Tensor | None,
         routed_scaling_factor: float = 1.0,
     ) -> torch.Tensor | None:
-        """Ask MLB how this layer's traffic should be split across replicas.
+        """Ask MLB to route this layer, recording resolved ids as a side effect.
 
-        Returns a ``[num_logical, max_replicas]`` share table laid out like
-        vLLM's own ``logical_to_physical_map``, or None when the policy did not
-        produce one -- in which case the caller keeps its built-in choice.
-
-        The point of asking for the table rather than for per-token ids is that
-        vLLM fuses replica selection and expert-load recording into one kernel.
-        Taking over the ids means taking over the recording too, and
-        reimplementing the record gate, the padding mask and the physical
-        counting alongside a kernel that already does all three is duplication
-        that silently drifts. Handing back a table keeps every one of those in
-        vLLM's kernel, and MLB keeps the part that is genuinely its own: the
-        solve.
+        Always returns ``None``: every replica policy resolves its own ids
+        (``self._last_physical_ids``) rather than answering with a share table
+        for this method to hand back. The resolved ids are what
+        ``resolve_routing`` reads after this call returns.
 
         ``routed_scaling_factor`` is plumbed but left at its default: MLB only
         reads it when materializing a shared-expert decision, and vLLM's CUDA
@@ -737,13 +712,10 @@ class MlbRoutingRuntime:
                 layer_id=layer_id,
                 logical_topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                placement=self._snapshot(
-                    layer_state, layer_id, defer_dispatch=self._defer_dispatch
-                ),
+                placement=self._snapshot(layer_state, layer_id),
                 stage=_current_stage(),
                 token_count=num_unpadded_tokens,
                 routed_scaling_factor=routed_scaling_factor,
-                defer_dispatch=self._defer_dispatch,
                 global_logical_count=global_count,
                 # Let the policy count while it is already visiting every
                 # routed slot. Without this the layer launches a second kernel
@@ -772,27 +744,19 @@ class MlbRoutingRuntime:
                 self._l2_us.clear()
                 self._time_l2 = 0
 
-        selection = decision.metadata.get("replica_selection")
-        if selection is None:
-            # The contract's primary return is per-token physical ids; the
-            # share table is the alternative a fused runtime asks for. A policy
-            # that answers with ids has decided, and dropping that answer here
-            # is what silently turned such policies into no-ops.
-            ids = decision.routed_physical_topk_ids
-            if ids is None or ids is topk_ids:
-                return None
-            self._last_physical_ids = ids
-            return None
-
         # MLB_DUMP_LP=<dir> captures what the solve was given and what it
         # returned, so the achievable headroom can be computed offline instead
-        # of inferred from end-to-end throughput. Diagnostic only.
+        # of inferred from end-to-end throughput. Diagnostic only. Unconditional
+        # on which policy is active -- global_count/candidates/counts come from
+        # layer_state regardless, and lp_probability is None for anything but
+        # LPLB, which is exactly what "no LP ran here" should look like.
         if self._dump_lp_skip > 0:
             self._dump_lp_skip -= 1
         elif self._dump_lp_dir is not None and self._dump_lp_left > 0:
             import os as _os
 
             self._dump_lp_left -= 1
+            lp_probability = decision.metadata.get("lp_probability")
             torch.save(
                 {
                     "layer_id": layer_id,
@@ -805,14 +769,26 @@ class MlbRoutingRuntime:
                     "global_count": (
                         None if global_count is None else global_count.float().cpu()
                     ),
-                    "probability": selection.probability.float().cpu(),
+                    "probability": (
+                        None
+                        if lp_probability is None
+                        else lp_probability.float().cpu()
+                    ),
                 },
                 _os.path.join(
                     self._dump_lp_dir,
                     f"lp_r{self.ep_rank}_l{layer_id}_{self._dump_lp_left}.pt",
                 ),
             )
-        return selection.probability
+
+        # Every replica policy resolves its own ids now; none answers with a
+        # share table for this runtime to apply. Record the ids for
+        # resolve_routing to pick up.
+        ids = decision.routed_physical_topk_ids
+        if ids is None or ids is topk_ids:
+            return None
+        self._last_physical_ids = ids
+        return None
 
 
 
