@@ -244,9 +244,26 @@ if current_platform.is_cuda_alike():
             from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
 
             routing = get_mlb_routing()
-            # The policy itself declares whether it wants the routing boundary;
-            # a pipeline with no post-TopK stage leaves the fused kernel alone.
-            if routing is not None and routing.requires_post_topk_routing:
+            # A policy that decides from the committed placement alone has
+            # nothing to add per forward: its answer was already materialised
+            # into a one-column candidate map when the placement committed, so
+            # substitute that map and skip the call. This is the same shape as
+            # SGLang's `static`, which is one tensor index inside its own TopK
+            # path -- there is no external call there to pay for, and there
+            # should not be one here either. Measured at 426 us per layer per
+            # forward, or 26 ms of a ~1 s forward, which is what made `static`
+            # trail the built-in selection it reproduces exactly.
+            _layer_id = getattr(layer_state, "moe_layer_idx", None)
+            fixed = (
+                routing.fixed_dispatch_maps(_layer_id)
+                if routing is not None
+                and getattr(routing, "dispatch_fixed_by_placement", False)
+                and _layer_id is not None
+                else None
+            )
+            if fixed is not None:
+                logical_to_physical_map, logical_replica_count = fixed
+            elif routing is not None and routing.requires_post_topk_routing:
                 replica_prob, physical_ids = routing.resolve_routing(
                     topk_ids, topk_weights, layer_state, num_unpadded_tokens
                 )

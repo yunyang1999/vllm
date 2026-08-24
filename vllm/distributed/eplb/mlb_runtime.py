@@ -135,6 +135,14 @@ class MlbRoutingRuntime:
         # so this bounds the replica count without reading the map off device.
         self._max_replicas = num_physical_experts - num_logical_experts + 1
         self._default_replicas: torch.Tensor | None = None
+        # Until a placement commits, assume there is a choice to make; the
+        # first commit replaces this with what the placement actually offers.
+        self._placement_offers_replica_choice: bool = True
+        # The same table in the layout the fused kernel reads: one candidate
+        # column per logical expert, and a replica count of 1 so the kernel's
+        # `hash % count` lands on it. Built once per placement.
+        self._fixed_map: torch.Tensor | None = None
+        self._fixed_counts: torch.Tensor | None = None
         # [num_physical_experts] — slot i belongs to rank (i // experts_per_rank).
         # Passed to every PlacementSnapshot so LPLB can incorporate cross-GPU
         # transfer cost; SGLang always provides this, we build it from topology.
@@ -163,6 +171,13 @@ class MlbRoutingRuntime:
         self.requires_post_topk_routing = caps.requires_post_topk_routing
         self.requires_placement_state = caps.requires_placement_state
         self.requires_rank_dispatch_map = caps.requires_rank_dispatch_map
+        # A policy whose answer depends only on the committed placement does
+        # not need the per-forward call at all: bake the answer into a map the
+        # fused kernel already knows how to read, and the boundary disappears.
+        # getattr, because an older MLB has no such field.
+        self.dispatch_fixed_by_placement = getattr(
+            caps, "dispatch_fixed_by_placement", False
+        )
         # Declared by the pipeline rather than inferred from "has a post-TopK
         # policy": a replica policy can route from placement alone, and
         # gathering the EP-wide load for it costs a collective per step that is
@@ -413,6 +428,8 @@ class MlbRoutingRuntime:
         """
         if not self.requires_rank_dispatch_map:
             self._default_replicas = None
+            self._fixed_map = None
+            self._fixed_counts = None
             return
 
         from moe_load_balancer.adapters.vllm import nearest_replica_table
@@ -436,6 +453,44 @@ class MlbRoutingRuntime:
             ]
         )
 
+        if not self.dispatch_fixed_by_placement:
+            self._fixed_map = None
+            self._fixed_counts = None
+            return
+
+        # [layers, num_logical] -> [layers, num_logical, 1]. One column, so the
+        # kernel's gather strides by 1 instead of by the candidate map's padded
+        # width of MAX_EXPERT_REDUNDANCY + 1, and reads a table small enough to
+        # stay cached.
+        self._fixed_map = (
+            self._default_replicas.to(self._logical_to_physical_map.dtype)
+            .unsqueeze(-1)
+            .contiguous()
+        )
+        # Every expert has exactly one candidate in that layout, so `hash %
+        # count` is 0 for every token and the kernel returns column 0 -- which
+        # is the replica this policy chose. Same answer as calling the policy
+        # per forward, without the call.
+        self._fixed_counts = torch.ones(
+            self._default_replicas.shape[1],
+            dtype=self._logical_replica_count.dtype,
+            device=self._default_replicas.device,
+        ).contiguous()
+
+    def fixed_dispatch_maps(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The placement-resolved map and counts for a layer, if there is one.
+
+        Returned in place of calling the routing pipeline: for a policy that
+        decides from placement alone, the per-forward call produced this same
+        answer at a measured 426 us per layer against a policy-free path that
+        costs nothing.
+        """
+        if self._fixed_map is None or self._fixed_counts is None:
+            return None
+        return self._fixed_map[layer_id], self._fixed_counts
+
     def register_logical_maps(
         self, logical_to_physical_map: torch.Tensor, logical_replica_count: torch.Tensor
     ) -> None:
@@ -447,6 +502,24 @@ class MlbRoutingRuntime:
         """
         self._logical_to_physical_map = logical_to_physical_map
         self._logical_replica_count = logical_replica_count
+        # Does this placement give any expert a second copy? If not, every
+        # replica policy -- static, dynamic, dynamic_random, lplb alike -- can
+        # only return the identity, and consulting one is pure cost.
+        #
+        # Read once here rather than per forward: `.any()` on a CUDA tensor is
+        # a device sync, which is cheap at a rearrangement and ruinous inside a
+        # forward. Kept as a Python bool for that reason.
+        #
+        # This belongs to the placement, not to a policy. LPLB happens to
+        # short-circuit itself (`num_red_log == 0` leaves its LP with nothing
+        # to solve), static does not -- it consults its nearest-replica table
+        # whatever the redundancy is. Leaving each policy to notice the
+        # degenerate case independently is how that asymmetry arose, and it is
+        # exactly what made a red0 row -- where by construction no policy can
+        # differ -- report a 2.6% spread between them.
+        self._placement_offers_replica_choice = bool(
+            (logical_replica_count > 1).any().item()
+        )
         self._rebuild_default_replicas()
 
     def announce_initial_placement(self) -> None:
@@ -623,6 +696,17 @@ class MlbRoutingRuntime:
         if self._logical_count_local is not None and not torch._dynamo.is_compiling():
             local = count_logical_experts(topk_ids, self.num_logical_experts)
             self._logical_count_local[layer_id].copy_(local)
+        # A placement with no redundancy leaves a replica policy nothing to
+        # decide: every logical expert has exactly one physical copy, so the
+        # only answer any of them can give is the one the framework's own
+        # kernel already produces. Return before the pipeline runs.
+        #
+        # After the count write above, not before it -- the counts feed the
+        # next placement and LPLB's solve, and neither stops being wanted just
+        # because this placement happens to be degenerate.
+        if not self._placement_offers_replica_choice:
+            return None
+
         # Only policies that read the load have to wait for it. Gating every
         # policy on this readiness flag disabled the ones that never asked for
         # a count: their buffers are not allocated, so the flag never flips and
