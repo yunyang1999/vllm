@@ -280,8 +280,6 @@ class MlbRoutingRuntime:
         # Set by replica_shares when a policy answers with ids; read by
         # resolve_routing in the same call.
         self._last_physical_ids: torch.Tensor | None = None
-        # Whether the policy already accumulated this layer's load.
-        self._last_recorded_load: bool = False
         self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
         self._l2_us: list[float] = []
 
@@ -594,16 +592,6 @@ class MlbRoutingRuntime:
             self._logical_to_physical_map.shape[0],
         )
 
-    @property
-    def recorded_load(self) -> bool:
-        """Whether the last resolved layer also accumulated its own load.
-
-        False whenever the policy declined or no view was offered, so the
-        caller's own recording pass stays the default rather than something
-        that has to be re-enabled.
-        """
-        return self._last_recorded_load
-
     def resolve_routing(
         self,
         topk_ids: torch.Tensor,
@@ -649,7 +637,6 @@ class MlbRoutingRuntime:
         from moe_load_balancer.kernels.expert_count import count_logical_experts
 
         self._last_physical_ids = None
-        self._last_recorded_load = False
         layer_id = layer_state.moe_layer_idx
         if layer_id is None:
             raise RuntimeError(
@@ -717,17 +704,8 @@ class MlbRoutingRuntime:
                 token_count=num_unpadded_tokens,
                 routed_scaling_factor=routed_scaling_factor,
                 global_logical_count=global_count,
-                # Let the policy count while it is already visiting every
-                # routed slot. Without this the layer launches a second kernel
-                # over the same elements purely to accumulate the load view,
-                # which measured 7.6 ms per forward against 1.6 ms for the
-                # fused kernel that was opened to make room for the policy.
-                expert_load_view=layer_state.expert_load_view,
-                record_enabled=layer_state.should_record_tensor,
-                num_unpadded_tokens=num_unpadded_tokens,
             )
         )
-        self._last_recorded_load = bool(getattr(decision, "recorded_load", False))
         if self._time_l2:
             torch.cuda.synchronize()
             self._l2_us.append((time.perf_counter() - _t0) * 1e6)

@@ -76,30 +76,9 @@ def _layer_state(rt: MlbRoutingRuntime, layer_id: int = 0) -> EplbLayerState:
     return state
 
 
-def test_lplb_asks_for_the_table_rather_than_the_ids():
-    """MLB is asked how to split traffic, not for per-token ids -- that is what
-    keeps expert-load recording inside vLLM's kernel.
-
-    `lplb` needs an EP all-reduce to solve, so it cannot run in a single
-    process; assert on the request this path builds instead. The table is
-    consumed by the kernel, which has its own tests.
-    """
-    from moe_load_balancer.adapters.vllm import to_routing_request
-
-    request = to_routing_request(
-        layer_id=0,
-        logical_topk_ids=torch.zeros(2, 2, dtype=torch.int64),
-        topk_weights=torch.zeros(2, 2),
-        defer_dispatch=True,
-    )
-    assert request.defer_dispatch is True
-
-
-def test_every_replica_policy_answers_the_deferred_dispatch_request():
-    """A runtime that fuses replica selection with expert-load recording asks
-    for a share table because it cannot give up the per-token step. A policy
-    that returned nothing here was not falling back gracefully -- it never ran
-    at all, and the caller silently kept its built-in choice."""
+def test_every_replica_policy_resolves_ids_rather_than_going_silent():
+    """A policy that returned nothing here was not falling back gracefully --
+    it never ran at all, and the caller silently kept its built-in choice."""
     rt = _runtime("dynamic")
     state = _layer_state(rt)
     torch.manual_seed(0)
@@ -107,20 +86,10 @@ def test_every_replica_policy_answers_the_deferred_dispatch_request():
     shares, ids = rt.resolve_routing(
         logical, torch.rand(NUM_TOKENS, TOPK), state, None
     )
-    # The contract is that the policy answers, not that it answers in one
-    # particular form: a runtime that fuses selection with recording asks for a
-    # share table, one that lets the policy resolve replicas takes ids. What
-    # must never happen is neither, which is how these policies used to look
-    # like they were doing nothing.
-    assert (shares is None) != (ids is None), "exactly one form must come back"
-    if shares is not None:
-        counts = rt._logical_replica_count[0]
-        row = shares[int((counts == 2).nonzero()[0])]
-        assert torch.allclose(row[:2], torch.full((2,), 0.5), atol=1e-6)
-        single = shares[int((counts == 1).nonzero()[0])]
-        assert single[0].item() == 1.0 and single[1].item() == 0.0
-    else:
-        assert ids.shape == logical.shape
+    # Every replica policy resolves its own ids now; none hands back a share
+    # table for this method to apply.
+    assert shares is None
+    assert ids is not None and ids.shape == logical.shape
 
 
 def test_synthesized_default_prefers_local_replicas():
@@ -488,39 +457,6 @@ def test_a_policy_without_placement_state_needs_no_such_delivery():
     cached that a placement change could invalidate."""
     rt = _runtime("static")
     assert rt.requires_placement_state is False
-
-
-def test_a_share_table_is_built_over_the_map_the_kernel_will_index():
-    """Collapsing the candidate list is safe only when ids come back.
-
-    The kernel resolves column j against vLLM's own candidate map, which is
-    never collapsed. A table built over a shortened list therefore means
-    something different on each side: to the policy column 0 is this rank's
-    local replica, to the kernel it is the globally-first one. The ranks that
-    own a copy end up routed away from it.
-    """
-    rt = _runtime("static")
-    state = _layer_state(rt)
-    deferred = rt._snapshot(state, 0, defer_dispatch=True)
-    direct = rt._snapshot(state, 0)
-
-    # The deferred snapshot must present the same candidate layout the kernel
-    # will index, i.e. the uncollapsed map.
-    assert torch.equal(
-        deferred.logical_to_physical_candidates,
-        rt._logical_to_physical_map[0][:, : rt._max_replicas],
-    )
-    assert torch.equal(deferred.logical_to_physical_count, rt._logical_replica_count[0])
-
-    # The direct path still collapses: a policy returning ids resolves them
-    # itself, so a local-only list is exactly the locality hint it wants.
-    assert rt.requires_rank_dispatch_map
-    replicated = (rt._logical_replica_count[0] > 1).nonzero()
-    if replicated.numel():
-        lg = int(replicated[0])
-        assert int(direct.logical_to_physical_count[lg]) <= int(
-            deferred.logical_to_physical_count[lg]
-        )
 
 
 def test_the_nearest_replica_table_is_refreshed_on_every_commit():
