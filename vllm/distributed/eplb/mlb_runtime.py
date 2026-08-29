@@ -766,6 +766,18 @@ class MlbRoutingRuntime:
         if self._ultraep_rank_quota_prefix is None:
             return
 
+        # is_due() is pure Python counter bookkeeping -- no GPU access, never
+        # syncs -- and is always cheap to call. Computing `representative`
+        # below is not: num_unpadded_tokens.item() is a real CPU-GPU sync,
+        # and paying it on every one of interval-1-out-of-interval calls
+        # where should_refresh could not possibly say yes anyway is exactly
+        # the class of per-forward cost this file goes to real lengths to
+        # avoid elsewhere (see finalize_step_counts's whole reason for
+        # existing). Check is_due first; only compute representative and
+        # call should_refresh when it says a refresh could happen this call.
+        if not self._ultraep_refresh_gate.is_due(layer_id):
+            return
+
         representative = (
             num_unpadded_tokens is not None
             and int(num_unpadded_tokens.item())
@@ -840,11 +852,49 @@ class MlbRoutingRuntime:
             self._ultraep_expert_weights[layer_id][0],
             self._ultraep_expert_weights[layer_id][1],
         )
+
+        # The Manager's own placement is the ground truth for what
+        # weight_sync actually populated -- not the plan.physical_to_
+        # logical_map written above, which has already had every -1 the
+        # kernel left filled with a same-rank fallback master id (see
+        # UltraEPL3Policy.plan() in policies/l3/ultraep.py: that fallback
+        # exists so the framework's *other* dense-mapping consumers, e.g.
+        # the load-history scatter, never see -1 -- it does not describe
+        # what this specific transfer actually moved). A redundant slot the
+        # Manager declined -- most commonly because the logical expert it
+        # would have replicated is already this rank's own master, which
+        # update_placement_sparse correctly leaves unassigned rather than
+        # "replicate onto yourself" -- still reads as a plausible logical id
+        # from the plan, and copying its buffer row unconditionally silently
+        # writes stale data there: confirmed by a real GPU verification with
+        # distinctive per-expert weight values before this mask was added
+        # (see /root/yuny/l3lab/vllm_probe/scratch/
+        # verify_fast_refresh_weight_copy.py) -- 0/128 elements correct for
+        # exactly this case, no exception raised. torch.where, not a
+        # boolean-mask assignment on a chained slice, so an unassigned row
+        # provably keeps its prior value rather than depending on in-place-
+        # through-a-view semantics.
+        num_local_physical = self.num_physical_experts // self.ep_size
+        my_redundant_p2l = manager.physical_to_logical_map[layer_id][
+            self.ep_rank * num_local_physical
+            + num_local_master : (self.ep_rank + 1) * num_local_physical
+        ]
+        assigned = my_redundant_p2l >= 0
+        w13_assigned = assigned.view(-1, *([1] * (w13.dim() - 1)))
+        w2_assigned = assigned.view(-1, *([1] * (w2.dim() - 1)))
         w13[num_local_master:].copy_(
-            manager.local_replica_fc1_weight_buffer.view_as(w13[num_local_master:])
+            torch.where(
+                w13_assigned,
+                manager.local_replica_fc1_weight_buffer.view_as(w13[num_local_master:]),
+                w13[num_local_master:],
+            )
         )
         w2[num_local_master:].copy_(
-            manager.local_replica_fc2_weight_buffer.view_as(w2[num_local_master:])
+            torch.where(
+                w2_assigned,
+                manager.local_replica_fc2_weight_buffer.view_as(w2[num_local_master:]),
+                w2[num_local_master:],
+            )
         )
 
     def replica_shares(
