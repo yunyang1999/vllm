@@ -280,6 +280,10 @@ class MlbRoutingRuntime:
         # Set by replica_shares when a policy answers with ids; read by
         # resolve_routing in the same call.
         self._last_physical_ids: torch.Tensor | None = None
+        # Set by plan_placement() after an UltraEP L1 solve, read by
+        # _snapshot() on every forward until the next solve replaces it.
+        # None for every other L1 policy, and before the first solve.
+        self._ultraep_rank_quota_prefix: torch.Tensor | None = None
         self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
         self._l2_us: list[float] = []
 
@@ -385,6 +389,7 @@ class MlbRoutingRuntime:
             )
 
         defaults = self._default_replicas
+        quota = self._ultraep_rank_quota_prefix
         return to_placement_snapshot(
             layer_state,
             layer_id,
@@ -398,6 +403,7 @@ class MlbRoutingRuntime:
                 None if defaults is None else defaults[layer_id]
             ),
             physical_to_rank_map=self._physical_to_rank_map,
+            rank_quota_prefix=None if quota is None else quota[layer_id],
         )
 
     def _rebuild_default_replicas(self) -> None:
@@ -874,14 +880,14 @@ def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | 
     if not algorithm:
         return None
     try:
-        from moe_load_balancer import DeploymentTopology
+        from moe_load_balancer import ExpertDeploymentConfig
         from moe_load_balancer.core.routing_pipeline import RoutingPipeline
 
         pipeline = RoutingPipeline.from_value(algorithm)
     except Exception:
         return None
     return pipeline.is_applicable(
-        DeploymentTopology(
+        ExpertDeploymentConfig(
             num_redundant_experts=num_redundant_experts,
             routes_shared_expert=False,
         )
@@ -892,7 +898,23 @@ def plan_placement(request):
     """Run L1 through the engine's balancer and hand back vLLM's one map."""
     from moe_load_balancer.adapters.vllm import to_vllm_physical_to_logical
 
-    plan = get_mlb_integration().balancer().plan_placement(request)
+    integration = get_mlb_integration()
+    plan = integration.balancer().plan_placement(request)
+    # UltraEP is the only L1 policy that publishes this; every other plan's
+    # metadata simply lacks the key, so this stays a no-op for them. Routing
+    # geometry can lag placement (see balancer()'s docstring), so there may be
+    # no runtime to hand the quota to yet -- it reads whatever the next solve
+    # after bind_routing() leaves here.
+    #
+    # Stashed here rather than after the caller commits the weight move: no
+    # forward can observe this quota paired with the placement it belongs to
+    # before that commit happens, because MlbEplbPolicy requires synchronous
+    # (use_async=False) rearrangement -- nothing else runs on this thread
+    # between this return and register_logical_maps(). An async L1 path would
+    # need this to move to the commit step instead.
+    quota = plan.metadata.get("rank_quota_prefix")
+    if quota is not None and integration.routing is not None:
+        integration.routing._ultraep_rank_quota_prefix = quota
     return to_vllm_physical_to_logical(plan), plan
 
 

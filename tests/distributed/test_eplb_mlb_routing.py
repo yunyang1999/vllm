@@ -213,6 +213,27 @@ def test_replica_routing_sees_every_replica_not_just_the_local_one():
     assert int(st_snapshot.logical_to_physical_count[0]) == 1
 
 
+def test_ultraep_quota_reaches_the_snapshot_only_when_set():
+    """The per-layer quota table UltraEP's L1 solve produces has to reach L2
+    routing through the snapshot, or the quota never influences dispatch at
+    all and the router silently falls back to a fixed single replica."""
+    rt = _runtime("ultraep")
+    state = _layer_state(rt)
+
+    # Before any L1 solve has run, there is nothing to thread through.
+    assert rt._snapshot(state, 0).metadata.get("rank_quota_prefix") is None
+
+    # plan_placement() stashes the whole per-layer tensor; _snapshot() must
+    # slice it by the layer actually being routed, not just pass it through.
+    quota = torch.arange(NUM_LAYERS * 3 * 5, dtype=torch.int32).reshape(
+        NUM_LAYERS, 3, 5
+    )
+    rt._ultraep_rank_quota_prefix = quota
+    for layer_id in range(NUM_LAYERS):
+        snapshot = rt._snapshot(state, layer_id)
+        assert torch.equal(snapshot.metadata["rank_quota_prefix"], quota[layer_id])
+
+
 def test_commit_is_skipped_for_policies_without_placement_state(monkeypatch):
     rt = _runtime("dynamic")
     calls = []
@@ -358,7 +379,8 @@ def _sized_runtime(algorithm: str, num_redundant: int = 8) -> MlbRoutingRuntime:
 
 
 @pytest.mark.parametrize(
-    "algorithm, consumes", [("lplb", True), ("static", False), ("dynamic", False)]
+    "algorithm, consumes",
+    [("lplb", True), ("static", False), ("dynamic", False), ("ultraep", False)],
 )
 def test_only_policies_that_read_the_load_pay_for_gathering_it(algorithm, consumes):
     """The count machinery follows what the policy declares, not "has a
@@ -386,6 +408,13 @@ def test_the_runtime_reports_what_the_framework_must_respect():
     lp = _sized_runtime("lplb")
     assert lp.supports_concurrent_microbatches is False
     assert lp.graph_stability == "realloc_on_placement_change"
+
+    # ultraep caches a per-layer state dict on every route_tokens() call, and
+    # the quota tensor it caches is a fresh allocation each L1 replan rather
+    # than an in-place update -- the same hazard LPLB's solver state has.
+    ue = _sized_runtime("ultraep")
+    assert ue.supports_concurrent_microbatches is False
+    assert ue.graph_stability == "realloc_on_placement_change"
 
 
 def test_placement_and_routing_share_one_balancer():
