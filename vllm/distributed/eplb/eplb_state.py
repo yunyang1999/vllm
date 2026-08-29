@@ -565,6 +565,7 @@ class EplbState:
                 physical_to_logical_map=physical_to_logical_map,
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
+                expert_weights=model.expert_weights,
                 # A step interval that the run can actually reach means the
                 # placement will be re-planned, which is the case a captured
                 # graph cannot follow when the policy keeps solver state.

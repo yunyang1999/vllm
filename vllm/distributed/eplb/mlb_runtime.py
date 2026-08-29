@@ -119,6 +119,7 @@ class MlbRoutingRuntime:
         num_physical_experts: int,
         physical_to_logical_map: torch.Tensor,
         balancer: object | None = None,
+        expert_weights: "Any | None" = None,
     ) -> None:
         from moe_load_balancer import MoELoadBalancer
 
@@ -295,6 +296,102 @@ class MlbRoutingRuntime:
         self._ultraep_replica_counts: torch.Tensor | None = None
         self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
         self._l2_us: list[float] = []
+
+        # Real, traffic-driven placement refresh with real weight transfer
+        # (ultra_ep's Manager), additive to plan_placement()'s slow,
+        # wall-clock-cadence path above: that path still owns this model's
+        # *initial* placement (the buffers this refresh later writes
+        # per-layer slices into do not exist before its first solve -- see
+        # the None-guard in _ultraep_fast_refresh), this only adds much more
+        # frequent updates on top of it. See UltraEPExpertTransfer in the
+        # SGLang reference integration for the architecture this mirrors:
+        # the Manager owns weight movement only, never token dispatch --
+        # UltraEPL2Router (unchanged) stays the dispatch mechanism, fed by
+        # the same deterministic solve this refresh also hands the Manager,
+        # so the two agree without an explicit data bridge.
+        self._ultraep_manager: Any = None
+        self._ultraep_expert_weights: Any = None
+        self._ultraep_refresh_gate: Any = None
+        self._ultraep_min_representative_tokens = int(
+            os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "8")
+        )
+        if algorithm == "ultraep" and expert_weights is not None:
+            self._init_ultraep_fast_refresh(expert_weights)
+
+    def _init_ultraep_fast_refresh(self, expert_weights: Any) -> None:
+        """One-time Manager setup: register this rank's master expert
+        weights so ``weight_sync`` has real pointers to copy from.
+
+        Eager, not lazy like the SGLang reference's ``UltraEPExpertTransfer``
+        (which registers on its *first* transfer() call, because the object
+        that owns it there is constructed before weights are loaded): vLLM
+        hands this runtime ``model.expert_weights`` at the same call site
+        that constructs it, so there is no "not loaded yet" window to defer
+        past.
+
+        Assumes exactly two per-layer weight tensors (fc1/w13-fused, then
+        fc2/w2), each shaped ``[num_local_physical_experts, ...]`` -- true
+        for the unquantized case this was verified against. A model whose
+        ``expert_weights`` also carries separate quantization-scale tensors
+        needs ``construct_local_master_ptr_pool``'s ``fc1_weight_scales``/
+        ``fc2_weight_scales`` wired up too; not attempted here.
+        """
+        try:
+            from ultra_ep import Manager
+        except ImportError:
+            logger.warning_once(
+                "ultraep fast refresh requires the ultra_ep package (not "
+                "installed); staying on the slow EplbState.rearrange() "
+                "cadence only."
+            )
+            return
+
+        from vllm.distributed import get_ep_group
+
+        num_local_master = self.num_logical_experts // self.ep_size
+        num_local_physical = self.num_physical_experts // self.ep_size
+        num_local_redundant = num_local_physical - num_local_master
+        num_layers = len(expert_weights)
+        w13_0, w2_0 = expert_weights[0][0], expert_weights[0][1]
+
+        manager = Manager(
+            group=get_ep_group().device_group,
+            num_layers=num_layers,
+            num_local_master_experts=num_local_master,
+            num_local_redundant_experts=num_local_redundant,
+            expert_fc1_numel=w13_0[0].numel(),
+            expert_fc2_numel=w2_0[0].numel(),
+            is_train=False,
+            explicitly_destroy=True,
+            weight_data_dtype=w13_0.dtype,
+            weight_scale_dtype=torch.float32,
+            expert_fc1_weight_scale_numel=0,
+            expert_fc2_weight_scale_numel=0,
+        )
+        for layer_id in range(num_layers):
+            w13, w2 = expert_weights[layer_id][0], expert_weights[layer_id][1]
+            manager.construct_local_master_ptr_pool(
+                layer_id,
+                list(w13[:num_local_master]),
+                list(w2[:num_local_master]),
+            )
+
+        from moe_load_balancer import RefreshGate
+
+        self._ultraep_manager = manager
+        self._ultraep_expert_weights = expert_weights
+        interval = int(os.environ.get("MLB_ULTRAEP_REFRESH_INTERVAL", "64"))
+        self._ultraep_refresh_gate = RefreshGate(interval)
+        logger.info(
+            "UltraEP fast refresh enabled (interval=%d representative "
+            "batches, min_tokens=%d, num_layers=%d, "
+            "num_local_master=%d, num_local_redundant=%d)",
+            interval,
+            self._ultraep_min_representative_tokens,
+            num_layers,
+            num_local_master,
+            num_local_redundant,
+        )
 
     def finalize_step_counts(self) -> None:
         """All-reduce per-layer local counts and update the stable LP input buffer.
@@ -635,6 +732,121 @@ class MlbRoutingRuntime:
         ids = None if shares is not None else self._last_physical_ids
         return shares, ids
 
+    def _ultraep_fast_refresh(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        num_unpadded_tokens: torch.Tensor | None,
+    ) -> None:
+        """Real, traffic-driven placement refresh + weight transfer, one layer.
+
+        Not CUDA-graph-safe: issues real collectives (all_gather, a
+        distributed weight transfer, a barrier) whenever it actually
+        refreshes, so it must never run under capture -- same reason
+        ``finalize_step_counts`` guards on the same check.
+
+        Gated on ``_ultraep_rank_quota_prefix`` already being allocated:
+        those whole-model buffers are only created by ``plan_placement()``'s
+        slow-path solve (see ``mlb_runtime.py``'s ``plan_placement``), which
+        still owns this model's *initial* placement. This refresh writes
+        only a per-layer slice into buffers that solve already allocated; it
+        does nothing before that first solve has run.
+
+        Writes its result directly into the same whole-model buffers
+        ``_snapshot()`` reads every forward (``physical_to_logical_map``,
+        ``_ultraep_logical_to_physical``, ``_ultraep_replica_counts``,
+        ``_ultraep_rank_quota_prefix``) rather than a separate pending store:
+        ``replica_shares()`` calls ``_snapshot()`` again immediately after
+        this returns, on its way to dispatch, so there is no window where a
+        separate "pending" representation could go stale relative to what
+        this just wrote.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if self._ultraep_rank_quota_prefix is None:
+            return
+
+        representative = (
+            num_unpadded_tokens is not None
+            and int(num_unpadded_tokens.item())
+            >= self._ultraep_min_representative_tokens
+        )
+        if not self._ultraep_refresh_gate.should_refresh(
+            layer_id, representative=representative
+        ):
+            return
+
+        from moe_load_balancer.adapters.vllm import to_placement_request
+        from moe_load_balancer.kernels.expert_count import count_logical_experts
+        from vllm.distributed import get_ep_group
+
+        ep_group = get_ep_group().device_group
+        local_count = count_logical_experts(
+            topk_ids, self.num_logical_experts, dtype=torch.int32
+        )
+        per_rank_count = local_count.new_empty((self.ep_size, self.num_logical_experts))
+        torch.distributed.all_gather_into_tensor(
+            per_rank_count, local_count.contiguous(), group=ep_group
+        )
+
+        request = to_placement_request(
+            per_rank_count[:, None, :],
+            num_replicas=self.num_physical_experts,
+            num_ranks=self.ep_size,
+            num_groups=1,
+            num_nodes=1,
+            algorithm="ultraep",
+            ep_rank=self.ep_rank,
+        )
+        plan = self._mlb.plan_placement(request)
+
+        # The request carried one synthetic layer (dim 0 of per_rank_count),
+        # so the plan's own layer index is always 0 regardless of layer_id --
+        # layer_id only selects where in *our* whole-model buffers this one
+        # layer's slice of the plan lands.
+        self.physical_to_logical_map[layer_id].copy_(plan.physical_to_logical_map[0])
+        self._ultraep_logical_to_physical[layer_id].copy_(
+            plan.logical_to_all_physical_map[0]
+        )
+        self._ultraep_replica_counts[layer_id].copy_(plan.logical_to_physical_count[0])
+        self._ultraep_rank_quota_prefix[layer_id].copy_(
+            plan.metadata["rank_quota_prefix"][0]
+        )
+
+        manager = self._ultraep_manager
+        manager.update_placement_sparse(layer_id, topk_ids.to(torch.int64))
+        event = manager.weight_sync(layer_id, async_finish=True)
+        # Proven-correct sequence from this integration's own standalone
+        # verification (see verify_ultra_ep_manager.py): the event only
+        # guarantees *local* stream ordering, not that a remote rank's
+        # one-sided write into this rank's memory has landed. Skipping the
+        # barrier after the wait reproduces a real, silent, non-crashing
+        # partial-copy corruption -- verified directly, not a theoretical
+        # concern being defended against.
+        event.current_stream_wait()
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=ep_group)
+        torch.cuda.synchronize()
+
+        # The Manager's replica buffers are its own fixed-size, single-layer
+        # scratch space (reused by every layer's sync, not addressed by
+        # layer_id) -- copy this layer's freshly-landed data out of them and
+        # into this layer's own slots in vLLM's own expert weight tensors
+        # before anything else can call weight_sync again and overwrite them,
+        # so the framework's existing, unmodified FFN compute keeps reading
+        # from exactly where it always has.
+        num_local_master = self.num_logical_experts // self.ep_size
+        w13, w2 = (
+            self._ultraep_expert_weights[layer_id][0],
+            self._ultraep_expert_weights[layer_id][1],
+        )
+        w13[num_local_master:].copy_(
+            manager.local_replica_fc1_weight_buffer.view_as(w13[num_local_master:])
+        )
+        w2[num_local_master:].copy_(
+            manager.local_replica_fc2_weight_buffer.view_as(w2[num_local_master:])
+        )
+
     def replica_shares(
         self,
         topk_ids: torch.Tensor,
@@ -697,6 +909,9 @@ class MlbRoutingRuntime:
         # they returned None for the lifetime of the run.
         if self.consumes_global_logical_count and not self._logical_count_ready:
             return None
+
+        if self._ultraep_manager is not None:
+            self._ultraep_fast_refresh(layer_id, topk_ids, num_unpadded_tokens)
 
         # Pass the PREVIOUS step's global count to MLB.  The stable tensor
         # slice has a fixed GPU address, so it is safe to use inside a
@@ -1000,6 +1215,7 @@ def init_mlb_routing(
     logical_to_physical_map: torch.Tensor,
     logical_replica_count: torch.Tensor,
     rearranges: bool = False,
+    expert_weights: Any | None = None,
 ) -> MlbRoutingRuntime | None:
     """Create the routing runtime for a configured L2 algorithm.
 
@@ -1007,6 +1223,11 @@ def init_mlb_routing(
     resolved the environment default and cleared itself for placements no L2
     policy can act on. Passing it in rather than re-reading the environment is
     what makes that decision binding.
+
+    ``expert_weights`` is the model's own ``expert_weights`` (one entry per
+    MoE layer, present at this same call site) -- only ``ultraep`` reads it,
+    to register real weight pointers with its transfer runtime. Every other
+    algorithm ignores it, so it is safe to leave unset.
     """
     global _runtime
     if not algorithm:
@@ -1019,6 +1240,7 @@ def init_mlb_routing(
         num_logical_experts=num_logical_experts,
         num_physical_experts=num_physical_experts,
         physical_to_logical_map=physical_to_logical_map,
+        expert_weights=expert_weights,
     )
     _runtime.register_logical_maps(logical_to_physical_map, logical_replica_count)
     # Keyed on the declared stability of the policy's state, not on whether it

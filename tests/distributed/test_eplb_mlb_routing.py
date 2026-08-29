@@ -92,6 +92,46 @@ def test_every_replica_policy_resolves_ids_rather_than_going_silent():
     assert ids is not None and ids.shape == logical.shape
 
 
+def test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep(monkeypatch):
+    """ultra_ep is an optional runtime dependency (real weight streaming);
+    its absence must not break placement/routing, only skip the fast-refresh
+    path and fall back to the slow EplbState.rearrange() cadence alone."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "ultra_ep", None)
+
+    num_local_physical = NUM_PHYSICAL // EP_SIZE
+    expert_weights = [
+        [torch.zeros(num_local_physical, 8, 8), torch.zeros(num_local_physical, 8, 8)]
+        for _ in range(NUM_LAYERS)
+    ]
+
+    phy2log = _placement()
+    rt = MlbRoutingRuntime(
+        "ultraep",
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        num_logical_experts=NUM_LOGICAL,
+        num_physical_experts=NUM_PHYSICAL,
+        physical_to_logical_map=phy2log,
+        expert_weights=expert_weights,
+    )
+    assert rt._ultraep_manager is None
+
+    # Routing must still work normally -- the fast-refresh path is purely
+    # additive, so its absence must be silent, not a degraded dispatch.
+    log2phy, replica_count = compute_logical_maps(phy2log, NUM_LOGICAL)
+    rt.register_logical_maps(log2phy, replica_count)
+    state = _layer_state(rt)
+    torch.manual_seed(0)
+    logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
+    shares, ids = rt.resolve_routing(
+        logical, torch.rand(NUM_TOKENS, TOPK), state, None
+    )
+    assert shares is None
+    assert ids is not None and ids.shape == logical.shape
+
+
 def test_synthesized_default_prefers_local_replicas():
     """vLLM keeps no per-rank dispatch table, so the adapter builds one.
     It must prefer a replica this rank owns -- that is the locality SGLang
