@@ -132,6 +132,51 @@ def test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep(monkeypatch):
     assert ids is not None and ids.shape == logical.shape
 
 
+def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
+    """UltraEP is a prefill-time algorithm (the paper's own scoping; SGLang's
+    reference should_refresh gates the same way, rejecting only its provable
+    "decode" stage). A decode-only batch must return before touching the
+    refresh gate's counter or attempting any collective/transfer work."""
+    import sys
+
+    import vllm.distributed.eplb.mlb_runtime as mlb_runtime
+
+    # Real Manager construction needs a real EP process group, which this
+    # unit test does not set up -- disable ultra_ep so __init__ leaves
+    # _ultraep_manager None, then override it with the exploding stub below.
+    monkeypatch.setitem(sys.modules, "ultra_ep", None)
+
+    num_local_physical = NUM_PHYSICAL // EP_SIZE
+    expert_weights = [
+        [torch.zeros(num_local_physical, 8, 8), torch.zeros(num_local_physical, 8, 8)]
+        for _ in range(NUM_LAYERS)
+    ]
+    phy2log = _placement()
+    rt = MlbRoutingRuntime(
+        "ultraep",
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        num_logical_experts=NUM_LOGICAL,
+        num_physical_experts=NUM_PHYSICAL,
+        physical_to_logical_map=phy2log,
+        expert_weights=expert_weights,
+    )
+
+    # Force the gate open -- a real Manager and pre-existing quota buffers,
+    # so a non-decode call would proceed into real collective/transfer work.
+    # A decode-stage call must never reach it: the stub raises if it does.
+    class _ExplodingManager:
+        def update_placement_sparse(self, *args, **kwargs):
+            raise AssertionError("must not be called for a decode-stage batch")
+
+    rt._ultraep_manager = _ExplodingManager()
+    rt._ultraep_rank_quota_prefix = torch.zeros(NUM_LAYERS, NUM_LOGICAL, EP_SIZE)
+    monkeypatch.setattr(mlb_runtime, "_current_stage", lambda: "decode")
+
+    topk_ids = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
+    rt._ultraep_fast_refresh(0, topk_ids, num_unpadded_tokens=None)
+
+
 def test_synthesized_default_prefers_local_replicas():
     """vLLM keeps no per-rank dispatch table, so the adapter builds one.
     It must prefer a replica this rank owns -- that is the locality SGLang

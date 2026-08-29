@@ -765,6 +765,15 @@ class MlbRoutingRuntime:
             return
         if self._ultraep_rank_quota_prefix is None:
             return
+        if _current_stage() == "decode":
+            # UltraEP is explicitly a prefill-time algorithm (the paper's own
+            # scoping; SGLang's reference should_refresh gates the same way,
+            # rejecting only its provable "decode" and accepting everything
+            # else, including its own "mixed"). A decode-only batch must not
+            # count toward this layer's refresh interval at all -- it never
+            # reaches is_due(), the same way SGLang's gate never touches its
+            # own batch counter for a rejected stage.
+            return
 
         # is_due() is pure Python counter bookkeeping -- no GPU access, never
         # syncs -- and is always cheap to call. Computing `representative`
