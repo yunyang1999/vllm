@@ -158,3 +158,24 @@ def test_no_expert_groups():
     weight = _skewed_load()
     phy2log = MlbEplbPolicy.rebalance_experts(weight, NUM_REPLICAS, 0, 1, NUM_RANKS)
     _assert_valid_placement(phy2log)
+
+
+def test_ep_rank_reaches_the_placement_request(monkeypatch):
+    """ultraep's placement kernel solves once per EP rank and validates the
+    value is in range, so the caller's rank must reach the request -- every
+    other algorithm ignores it, but the plumbing is shared."""
+    import vllm.distributed.eplb.mlb_runtime as mlb_runtime
+
+    real_placement_request = mlb_runtime.placement_request
+    captured = {}
+
+    def spy(*args, **kwargs):
+        captured["ep_rank"] = kwargs.get("ep_rank")
+        return real_placement_request(*args, **kwargs)
+
+    monkeypatch.setattr(mlb_runtime, "placement_request", spy)
+    weight = _skewed_load()
+    MlbEplbPolicy.rebalance_experts(
+        weight, NUM_REPLICAS, NUM_GROUPS, 1, NUM_RANKS, ep_rank=5
+    )
+    assert captured["ep_rank"] == 5

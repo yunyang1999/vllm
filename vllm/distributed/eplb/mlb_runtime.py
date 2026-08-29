@@ -281,9 +281,18 @@ class MlbRoutingRuntime:
         # resolve_routing in the same call.
         self._last_physical_ids: torch.Tensor | None = None
         # Set by plan_placement() after an UltraEP L1 solve, read by
-        # _snapshot() on every forward until the next solve replaces it.
+        # _snapshot() on every forward until the next solve replaces them.
         # None for every other L1 policy, and before the first solve.
+        #
+        # The candidate table and quota must come from the same solve: the
+        # quota indexes replicas by column against MLB's own candidate
+        # ordering, which is not guaranteed to be the same table -- same
+        # width, even -- as vLLM's own logical_to_physical_map, independently
+        # rebuilt from physical_to_logical_map through compute_logical_maps.
+        # So route with MLB's own table for this policy, not vLLM's.
         self._ultraep_rank_quota_prefix: torch.Tensor | None = None
+        self._ultraep_logical_to_physical: torch.Tensor | None = None
+        self._ultraep_replica_counts: torch.Tensor | None = None
         self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
         self._l2_us: list[float] = []
 
@@ -390,6 +399,13 @@ class MlbRoutingRuntime:
 
         defaults = self._default_replicas
         quota = self._ultraep_rank_quota_prefix
+        if quota is not None:
+            # The quota's replica columns are only meaningful against the
+            # candidate table MLB solved them from -- not vLLM's own
+            # candidates, independently rebuilt from physical_to_logical_map
+            # and not guaranteed to share its width, let alone its ordering.
+            candidates = self._ultraep_logical_to_physical[layer_id]
+            counts = self._ultraep_replica_counts[layer_id]
         return to_placement_snapshot(
             layer_state,
             layer_id,
@@ -906,6 +922,11 @@ def plan_placement(request):
     # no runtime to hand the quota to yet -- it reads whatever the next solve
     # after bind_routing() leaves here.
     #
+    # The candidate table and replica counts come along too, not just the
+    # quota: they must be read from this same plan, not rebuilt from
+    # phy2log through vLLM's own compute_logical_maps, or the quota's column
+    # ordering and width silently stop matching the table L2 routes against.
+    #
     # Stashed here rather than after the caller commits the weight move: no
     # forward can observe this quota paired with the placement it belongs to
     # before that commit happens, because MlbEplbPolicy requires synchronous
@@ -915,6 +936,8 @@ def plan_placement(request):
     quota = plan.metadata.get("rank_quota_prefix")
     if quota is not None and integration.routing is not None:
         integration.routing._ultraep_rank_quota_prefix = quota
+        integration.routing._ultraep_logical_to_physical = plan.logical_to_all_physical_map
+        integration.routing._ultraep_replica_counts = plan.logical_to_physical_count
     return to_vllm_physical_to_logical(plan), plan
 
 

@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from torch.distributed import ProcessGroup, all_reduce
+from torch.distributed import ProcessGroup, all_gather_into_tensor, all_reduce
 
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
@@ -936,8 +936,24 @@ class EplbState:
 
             global_expert_load_window = logical_expert_load_window.sum(dim=0)
             global_expert_load_windows.append(global_expert_load_window)
-        # Perform all-reduce to get the expert load across all ranks for each model
-        global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
+        # A policy that places redundant replicas by which rank is overloaded,
+        # not just which logical expert is hot, needs every rank's own count,
+        # which a sum-reducing all-reduce discards. Gather instead and derive
+        # the sum locally -- every other policy sees the identical value it
+        # always has, just computed one way.
+        wants_per_rank = getattr(self.policy, "wants_per_rank_weight", None)
+        if wants_per_rank is not None and wants_per_rank():
+            per_rank_expert_load_windows = self._allgather_list(
+                global_expert_load_windows
+            )
+            global_expert_load_windows = [
+                window.sum(dim=0) for window in per_rank_expert_load_windows
+            ]
+        else:
+            per_rank_expert_load_windows = [None] * len(global_expert_load_windows)
+            global_expert_load_windows = self._allreduce_list(
+                global_expert_load_windows
+            )
 
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
@@ -970,11 +986,29 @@ class EplbState:
             )
 
         # Get new expert mappings
-        for eplb_model_state, global_expert_load_window in zip(
-            self.model_states.values(), global_expert_load_windows
-        ):
+        rearrange_inputs = zip(
+            self.model_states.values(),
+            global_expert_load_windows,
+            per_rank_expert_load_windows,
+        )
+        for (
+            eplb_model_state,
+            global_expert_load_window,
+            per_rank_expert_load_window,
+        ) in rearrange_inputs:
             if not self.is_async or is_profile:
-                # Get new expert mappings for the model
+                # Get new expert mappings for the model. Unlike weight below,
+                # per_rank_weight stays on-device: it only ever feeds
+                # ultraep's CUDA placement kernel, never the CPU numpy solve
+                # every other algorithm here uses.
+                rebalance_kwargs = (
+                    {}
+                    if per_rank_expert_load_window is None
+                    else {
+                        "per_rank_weight": per_rank_expert_load_window,
+                        "ep_rank": ep_rank,
+                    }
+                )
                 new_physical_to_logical_map = self.policy.rebalance_experts(
                     global_expert_load_window.cpu(),
                     num_replicas,
@@ -982,6 +1016,7 @@ class EplbState:
                     num_nodes,
                     num_gpus,
                     eplb_model_state.physical_to_logical_map.cpu(),
+                    **rebalance_kwargs,
                 )
 
                 skip_rearrange = False
@@ -1227,6 +1262,27 @@ class EplbState:
             all_reduce_list.append(concat_tensor[offset : offset + shape[0], :])
             offset += shape[0]
         return all_reduce_list
+
+    def _allgather_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        """
+        All-gather a list of 2D tensors, one extra leading rank dimension each.
+
+        Only a placement policy that reweighs *which rank* is overloaded, not
+        just which logical expert is hot, needs this -- everything _allreduce_list
+        already serves is a plain sum, recoverable from this by summing dim 0.
+        Kept separate from _allreduce_list rather than folded into it: that
+        helper is shared with _sync_load_pass, a stats path with no reason to
+        pay for a gather it would immediately reduce anyway.
+        """
+        ep_group = get_ep_group().device_group
+        world_size = ep_group.size()
+        gathered = []
+        for tensor in tensor_list:
+            assert tensor.dim() == 2, "All tensors must be 2D."
+            out = tensor.new_empty((world_size, *tensor.shape))
+            all_gather_into_tensor(out, tensor.contiguous(), group=ep_group)
+            gathered.append(out)
+        return gathered
 
     def _sync_load_pass(self) -> list[torch.Tensor]:
         """

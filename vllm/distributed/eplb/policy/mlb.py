@@ -16,6 +16,16 @@ The MLB placement algorithm is selected with ``VLLM_MLB_L1_ALGORITHM``
 Note that ``use_async`` must be disabled: vLLM's async rearrangement path is
 validated only against the built-in policy (see ``EPLBConfig``), and MLB's
 planner runs synchronously on the caller's thread.
+
+``ultraep`` places redundant replicas by which *rank* is overloaded, not just
+which logical expert is hot, so it needs every rank's own count rather than
+the cross-rank sum every other algorithm here is happy with.
+:meth:`wants_per_rank_weight` tells ``EplbState.rearrange`` to gather instead
+of reduce and hand the per-rank breakdown back through ``per_rank_weight``.
+It also needs to know which rank *this call* is running on -- its placement
+kernel solves once per rank, not once globally, and validates ``rank`` is
+in range -- so ``EplbState.rearrange`` passes its own ``ep_rank`` alongside
+``per_rank_weight`` for the same policies.
 """
 
 from __future__ import annotations
@@ -42,6 +52,10 @@ class MlbEplbPolicy(AbstractEplbPolicy):
     """Delegate expert placement to the MoE Load Balancer core."""
 
     @classmethod
+    def wants_per_rank_weight(cls) -> bool:
+        return _algorithm() == "ultraep"
+
+    @classmethod
     def rebalance_experts(
         cls,
         weight: torch.Tensor,
@@ -50,6 +64,8 @@ class MlbEplbPolicy(AbstractEplbPolicy):
         num_nodes: int,
         num_ranks: int,
         old_global_expert_indices: torch.Tensor | None = None,
+        per_rank_weight: torch.Tensor | None = None,
+        ep_rank: int | None = None,
     ) -> torch.Tensor:
         try:
             from vllm.distributed.eplb.mlb_runtime import (
@@ -65,10 +81,20 @@ class MlbEplbPolicy(AbstractEplbPolicy):
 
         algorithm = _algorithm()
 
+        # ultraep's placement kernel derives the cross-rank sum itself from
+        # the per-rank breakdown, so hand that over whole instead of the
+        # already-summed weight every other algorithm here expects. Unlike
+        # every other algorithm's CPU numpy solve, ultraep's is a CUDA
+        # kernel -- it stays on-device rather than following weight.cpu().
+        logical_count = (
+            weight.float().cpu()
+            if per_rank_weight is None
+            else per_rank_weight.float()
+        )
         # vLLM passes num_groups=0 for models without expert groups; MLB
         # expresses "no grouping" as a single group.
         request = placement_request(
-            weight.float().cpu(),
+            logical_count,
             num_replicas=num_replicas,
             num_ranks=num_ranks,
             num_groups=num_groups or 1,
@@ -79,6 +105,7 @@ class MlbEplbPolicy(AbstractEplbPolicy):
                 if old_global_expert_indices is None
                 else old_global_expert_indices.cpu()
             ),
+            ep_rank=ep_rank,
         )
 
         # The engine's balancer, not a fresh one per rebalance: L1 and L2 must

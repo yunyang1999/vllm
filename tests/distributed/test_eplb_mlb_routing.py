@@ -213,25 +213,45 @@ def test_replica_routing_sees_every_replica_not_just_the_local_one():
     assert int(st_snapshot.logical_to_physical_count[0]) == 1
 
 
-def test_ultraep_quota_reaches_the_snapshot_only_when_set():
-    """The per-layer quota table UltraEP's L1 solve produces has to reach L2
-    routing through the snapshot, or the quota never influences dispatch at
-    all and the router silently falls back to a fixed single replica."""
+def test_ultraep_quota_and_candidates_reach_the_snapshot_only_when_set():
+    """The per-layer quota table and candidate table UltraEP's L1 solve
+    produces have to reach L2 routing through the snapshot *together*, or the
+    quota's replica columns get read against vLLM's own candidates -- rebuilt
+    independently from physical_to_logical_map, not guaranteed to share MLB's
+    width or column ordering -- rather than the table MLB solved it against.
+    """
     rt = _runtime("ultraep")
     state = _layer_state(rt)
 
-    # Before any L1 solve has run, there is nothing to thread through.
-    assert rt._snapshot(state, 0).metadata.get("rank_quota_prefix") is None
+    # Before any L1 solve has run, there is nothing to thread through, and
+    # the snapshot falls back to vLLM's own candidates untouched.
+    baseline = rt._snapshot(state, 0)
+    assert baseline.metadata.get("rank_quota_prefix") is None
+    assert torch.equal(
+        baseline.logical_to_physical_candidates, rt._logical_to_physical_map[0]
+    )
 
-    # plan_placement() stashes the whole per-layer tensor; _snapshot() must
-    # slice it by the layer actually being routed, not just pass it through.
+    # plan_placement() stashes the whole per-layer tensors; _snapshot() must
+    # slice each by the layer actually being routed, and must prefer MLB's
+    # own candidate table over vLLM's once a solve has produced one.
     quota = torch.arange(NUM_LAYERS * 3 * 5, dtype=torch.int32).reshape(
         NUM_LAYERS, 3, 5
     )
+    candidates = (
+        torch.arange(NUM_LAYERS * 3 * 5, dtype=torch.int64).reshape(NUM_LAYERS, 3, 5)
+        + 1000
+    )
+    counts = torch.full((NUM_LAYERS, 3), 2, dtype=torch.int64)
     rt._ultraep_rank_quota_prefix = quota
+    rt._ultraep_logical_to_physical = candidates
+    rt._ultraep_replica_counts = counts
     for layer_id in range(NUM_LAYERS):
         snapshot = rt._snapshot(state, layer_id)
         assert torch.equal(snapshot.metadata["rank_quota_prefix"], quota[layer_id])
+        assert torch.equal(
+            snapshot.logical_to_physical_candidates, candidates[layer_id]
+        )
+        assert torch.equal(snapshot.logical_to_physical_count, counts[layer_id])
 
 
 def test_commit_is_skipped_for_policies_without_placement_state(monkeypatch):
