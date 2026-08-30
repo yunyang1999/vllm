@@ -162,12 +162,12 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
         expert_weights=expert_weights,
     )
 
-    # Force the gate open -- a real L3 transfer and pre-existing quota
+    # Force the gate open -- a real weight transfer and pre-existing quota
     # buffers, so a non-decode call would proceed into real
     # collective/transfer work. A decode-stage call must never reach it:
     # the stub raises if it does.
     class _ExplodingTransfer:
-        def transfer(self, request):
+        def transfer(self, layer_id, topk_ids):
             raise AssertionError("must not be called for a decode-stage batch")
 
     rt._ultraep_transfer = _ExplodingTransfer()

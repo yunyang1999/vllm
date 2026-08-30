@@ -303,13 +303,16 @@ class MlbRoutingRuntime:
         # this refresh later writes per-layer slices into do not exist
         # before its first solve -- see the None-guard in
         # _ultraep_fast_refresh), this only adds much more frequent updates
-        # on top of it. The weight transfer itself is MLB's L3
-        # (moe_load_balancer.policies.l3.ultraep.UltraEPWeightTransfer,
-        # implementing core.l3.ExpertWeightTransfer) -- this file only
-        # solves placement and feeds it topk_ids, never touches ultra_ep's
-        # Manager directly. UltraEPL2Router (unchanged) stays the dispatch
-        # mechanism, fed by the same deterministic solve this refresh also
-        # hands L3, so the two agree without an explicit data bridge.
+        # on top of it. The weight transfer itself is UltraEP's own private
+        # execution detail (moe_load_balancer.policies.fused.
+        # ultraep_weight_transfer.UltraEPWeightTransfer) for making memory
+        # match a placement its L1 solve already decided -- not a general
+        # MLB protocol, since MLB has never defined one for that step; this
+        # file only solves placement and feeds it topk_ids, never touches
+        # ultra_ep's Manager directly. UltraEPL2Router (unchanged) stays the
+        # dispatch mechanism, fed by the same deterministic solve this
+        # refresh also hands the transfer backend, so the two agree without
+        # an explicit data bridge.
         self._ultraep_transfer: Any = None
         self._ultraep_refresh_gate: Any = None
         self._ultraep_min_representative_tokens = int(
@@ -319,8 +322,9 @@ class MlbRoutingRuntime:
             self._init_ultraep_fast_refresh(expert_weights)
 
     def _init_ultraep_fast_refresh(self, expert_weights: Any) -> None:
-        """One-time setup: hand MLB's L3 this rank's own master expert
-        weights so it has real memory to move data between.
+        """One-time setup: hand UltraEP's own weight-transfer backend this
+        rank's own master expert weights so it has real memory to move data
+        between.
 
         Eager, not lazy like the SGLang reference's ``UltraEPExpertTransfer``
         (which registers on its *first* transfer() call, because the object
@@ -357,7 +361,9 @@ class MlbRoutingRuntime:
         # (test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep)
         # depends on this ordering: get_ep_group() would assert before
         # register_weights() got a chance to raise ImportError.
-        from moe_load_balancer.policies.l3.ultraep import UltraEPWeightTransfer
+        from moe_load_balancer.policies.fused.ultraep_weight_transfer import (
+            UltraEPWeightTransfer,
+        )
         from vllm.distributed import get_ep_group
 
         num_local_master = self.num_logical_experts // self.ep_size
@@ -759,11 +765,12 @@ class MlbRoutingRuntime:
 
         The placement solve above is this file's own (MLB's L1, through
         ``self._mlb.plan_placement``); physically moving weight data to
-        match it is MLB's L3
-        (``moe_load_balancer.policies.l3.ultraep.UltraEPWeightTransfer``,
-        constructed in ``_init_ultraep_fast_refresh``) -- this method hands
-        it the same ``topk_ids`` the solve above was seeded from and nothing
-        else, so the two agree without an explicit data bridge.
+        match it is UltraEP's own private execution detail
+        (``moe_load_balancer.policies.fused.ultraep_weight_transfer.
+        UltraEPWeightTransfer``, constructed in
+        ``_init_ultraep_fast_refresh``) -- this method hands it the same
+        ``topk_ids`` the solve above was seeded from and nothing else, so
+        the two agree without an explicit data bridge.
         """
         if torch.cuda.is_current_stream_capturing():
             return
@@ -802,7 +809,6 @@ class MlbRoutingRuntime:
             return
 
         from moe_load_balancer.adapters.vllm import to_placement_request
-        from moe_load_balancer.core.types import WeightTransferRequest
         from moe_load_balancer.kernels.expert_count import count_logical_experts
         from vllm.distributed import get_ep_group
 
@@ -839,9 +845,7 @@ class MlbRoutingRuntime:
             plan.metadata["rank_quota_prefix"][0]
         )
 
-        self._ultraep_transfer.transfer(
-            WeightTransferRequest(layer_id=layer_id, routing_signal=topk_ids)
-        )
+        self._ultraep_transfer.transfer(layer_id, topk_ids)
 
     def replica_shares(
         self,
