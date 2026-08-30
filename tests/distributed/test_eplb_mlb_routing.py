@@ -116,7 +116,7 @@ def test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep(monkeypatch):
         physical_to_logical_map=phy2log,
         expert_weights=expert_weights,
     )
-    assert rt._ultraep_manager is None
+    assert rt._ultraep_transfer is None
 
     # Routing must still work normally -- the fast-refresh path is purely
     # additive, so its absence must be silent, not a degraded dispatch.
@@ -143,7 +143,7 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
 
     # Real Manager construction needs a real EP process group, which this
     # unit test does not set up -- disable ultra_ep so __init__ leaves
-    # _ultraep_manager None, then override it with the exploding stub below.
+    # _ultraep_transfer None, then override it with the exploding stub below.
     monkeypatch.setitem(sys.modules, "ultra_ep", None)
 
     num_local_physical = NUM_PHYSICAL // EP_SIZE
@@ -162,14 +162,15 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
         expert_weights=expert_weights,
     )
 
-    # Force the gate open -- a real Manager and pre-existing quota buffers,
-    # so a non-decode call would proceed into real collective/transfer work.
-    # A decode-stage call must never reach it: the stub raises if it does.
-    class _ExplodingManager:
-        def update_placement_sparse(self, *args, **kwargs):
+    # Force the gate open -- a real L3 transfer and pre-existing quota
+    # buffers, so a non-decode call would proceed into real
+    # collective/transfer work. A decode-stage call must never reach it:
+    # the stub raises if it does.
+    class _ExplodingTransfer:
+        def transfer(self, request):
             raise AssertionError("must not be called for a decode-stage batch")
 
-    rt._ultraep_manager = _ExplodingManager()
+    rt._ultraep_transfer = _ExplodingTransfer()
     rt._ultraep_rank_quota_prefix = torch.zeros(NUM_LAYERS, NUM_LOGICAL, EP_SIZE)
     monkeypatch.setattr(mlb_runtime, "_current_stage", lambda: "decode")
 

@@ -297,20 +297,20 @@ class MlbRoutingRuntime:
         self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
         self._l2_us: list[float] = []
 
-        # Real, traffic-driven placement refresh with real weight transfer
-        # (ultra_ep's Manager), additive to plan_placement()'s slow,
-        # wall-clock-cadence path above: that path still owns this model's
-        # *initial* placement (the buffers this refresh later writes
-        # per-layer slices into do not exist before its first solve -- see
-        # the None-guard in _ultraep_fast_refresh), this only adds much more
-        # frequent updates on top of it. See UltraEPExpertTransfer in the
-        # SGLang reference integration for the architecture this mirrors:
-        # the Manager owns weight movement only, never token dispatch --
-        # UltraEPL2Router (unchanged) stays the dispatch mechanism, fed by
-        # the same deterministic solve this refresh also hands the Manager,
-        # so the two agree without an explicit data bridge.
-        self._ultraep_manager: Any = None
-        self._ultraep_expert_weights: Any = None
+        # Real, traffic-driven placement refresh with real weight transfer,
+        # additive to plan_placement()'s slow, wall-clock-cadence path above:
+        # that path still owns this model's *initial* placement (the buffers
+        # this refresh later writes per-layer slices into do not exist
+        # before its first solve -- see the None-guard in
+        # _ultraep_fast_refresh), this only adds much more frequent updates
+        # on top of it. The weight transfer itself is MLB's L3
+        # (moe_load_balancer.policies.l3.ultraep.UltraEPWeightTransfer,
+        # implementing core.l3.ExpertWeightTransfer) -- this file only
+        # solves placement and feeds it topk_ids, never touches ultra_ep's
+        # Manager directly. UltraEPL2Router (unchanged) stays the dispatch
+        # mechanism, fed by the same deterministic solve this refresh also
+        # hands L3, so the two agree without an explicit data bridge.
+        self._ultraep_transfer: Any = None
         self._ultraep_refresh_gate: Any = None
         self._ultraep_min_representative_tokens = int(
             os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "8")
@@ -319,8 +319,8 @@ class MlbRoutingRuntime:
             self._init_ultraep_fast_refresh(expert_weights)
 
     def _init_ultraep_fast_refresh(self, expert_weights: Any) -> None:
-        """One-time Manager setup: register this rank's master expert
-        weights so ``weight_sync`` has real pointers to copy from.
+        """One-time setup: hand MLB's L3 this rank's own master expert
+        weights so it has real memory to move data between.
 
         Eager, not lazy like the SGLang reference's ``UltraEPExpertTransfer``
         (which registers on its *first* transfer() call, because the object
@@ -333,11 +333,11 @@ class MlbRoutingRuntime:
         fc2/w2), each shaped ``[num_local_physical_experts, ...]`` -- true
         for the unquantized case this was verified against. A model whose
         ``expert_weights`` also carries separate quantization-scale tensors
-        needs ``construct_local_master_ptr_pool``'s ``fc1_weight_scales``/
-        ``fc2_weight_scales`` wired up too; not attempted here.
+        needs ``UltraEPWeightTransfer.register_weights`` to grow scale
+        support; not attempted here.
         """
         try:
-            from ultra_ep import Manager
+            import ultra_ep  # noqa: F401 -- import-only probe, see below.
         except ImportError:
             logger.warning_once(
                 "ultraep fast refresh requires the ultra_ep package (not "
@@ -346,40 +346,36 @@ class MlbRoutingRuntime:
             )
             return
 
+        # Probed above, before get_ep_group(): a caller-side check, not
+        # register_weights()'s own -- that one still does its own `from
+        # ultra_ep import Manager` internally (the actual point of use, and
+        # the right behavior for a caller that skips this pre-check). This
+        # one exists only so a process_group=get_ep_group().device_group
+        # argument -- evaluated eagerly, before register_weights's body ever
+        # runs -- is never computed when ultra_ep is not installed. A test
+        # environment with no real EP process group but no ultra_ep either
+        # (test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep)
+        # depends on this ordering: get_ep_group() would assert before
+        # register_weights() got a chance to raise ImportError.
+        from moe_load_balancer.policies.l3.ultraep import UltraEPWeightTransfer
         from vllm.distributed import get_ep_group
 
         num_local_master = self.num_logical_experts // self.ep_size
         num_local_physical = self.num_physical_experts // self.ep_size
         num_local_redundant = num_local_physical - num_local_master
-        num_layers = len(expert_weights)
-        w13_0, w2_0 = expert_weights[0][0], expert_weights[0][1]
 
-        manager = Manager(
-            group=get_ep_group().device_group,
-            num_layers=num_layers,
+        transfer = UltraEPWeightTransfer()
+        transfer.register_weights(
+            expert_weights,
+            ep_size=self.ep_size,
             num_local_master_experts=num_local_master,
             num_local_redundant_experts=num_local_redundant,
-            expert_fc1_numel=w13_0[0].numel(),
-            expert_fc2_numel=w2_0[0].numel(),
-            is_train=False,
-            explicitly_destroy=True,
-            weight_data_dtype=w13_0.dtype,
-            weight_scale_dtype=torch.float32,
-            expert_fc1_weight_scale_numel=0,
-            expert_fc2_weight_scale_numel=0,
+            process_group=get_ep_group().device_group,
         )
-        for layer_id in range(num_layers):
-            w13, w2 = expert_weights[layer_id][0], expert_weights[layer_id][1]
-            manager.construct_local_master_ptr_pool(
-                layer_id,
-                list(w13[:num_local_master]),
-                list(w2[:num_local_master]),
-            )
 
         from moe_load_balancer import RefreshGate
 
-        self._ultraep_manager = manager
-        self._ultraep_expert_weights = expert_weights
+        self._ultraep_transfer = transfer
         interval = int(os.environ.get("MLB_ULTRAEP_REFRESH_INTERVAL", "64"))
         self._ultraep_refresh_gate = RefreshGate(interval)
         logger.info(
@@ -388,7 +384,7 @@ class MlbRoutingRuntime:
             "num_local_master=%d, num_local_redundant=%d)",
             interval,
             self._ultraep_min_representative_tokens,
-            num_layers,
+            len(expert_weights),
             num_local_master,
             num_local_redundant,
         )
@@ -760,6 +756,14 @@ class MlbRoutingRuntime:
         this returns, on its way to dispatch, so there is no window where a
         separate "pending" representation could go stale relative to what
         this just wrote.
+
+        The placement solve above is this file's own (MLB's L1, through
+        ``self._mlb.plan_placement``); physically moving weight data to
+        match it is MLB's L3
+        (``moe_load_balancer.policies.l3.ultraep.UltraEPWeightTransfer``,
+        constructed in ``_init_ultraep_fast_refresh``) -- this method hands
+        it the same ``topk_ids`` the solve above was seeded from and nothing
+        else, so the two agree without an explicit data bridge.
         """
         if torch.cuda.is_current_stream_capturing():
             return
@@ -798,6 +802,7 @@ class MlbRoutingRuntime:
             return
 
         from moe_load_balancer.adapters.vllm import to_placement_request
+        from moe_load_balancer.core.types import WeightTransferRequest
         from moe_load_balancer.kernels.expert_count import count_logical_experts
         from vllm.distributed import get_ep_group
 
@@ -834,76 +839,8 @@ class MlbRoutingRuntime:
             plan.metadata["rank_quota_prefix"][0]
         )
 
-        manager = self._ultraep_manager
-        manager.update_placement_sparse(layer_id, topk_ids.to(torch.int64))
-        event = manager.weight_sync(layer_id, async_finish=True)
-        # Proven-correct sequence from this integration's own standalone
-        # verification (see verify_ultra_ep_manager.py): the event only
-        # guarantees *local* stream ordering, not that a remote rank's
-        # one-sided write into this rank's memory has landed. Skipping the
-        # barrier after the wait reproduces a real, silent, non-crashing
-        # partial-copy corruption -- verified directly, not a theoretical
-        # concern being defended against.
-        event.current_stream_wait()
-        torch.cuda.synchronize()
-        torch.distributed.barrier(group=ep_group)
-        torch.cuda.synchronize()
-
-        # The Manager's replica buffers are its own fixed-size, single-layer
-        # scratch space (reused by every layer's sync, not addressed by
-        # layer_id) -- copy this layer's freshly-landed data out of them and
-        # into this layer's own slots in vLLM's own expert weight tensors
-        # before anything else can call weight_sync again and overwrite them,
-        # so the framework's existing, unmodified FFN compute keeps reading
-        # from exactly where it always has.
-        num_local_master = self.num_logical_experts // self.ep_size
-        w13, w2 = (
-            self._ultraep_expert_weights[layer_id][0],
-            self._ultraep_expert_weights[layer_id][1],
-        )
-
-        # The Manager's own placement is the ground truth for what
-        # weight_sync actually populated -- not the plan.physical_to_
-        # logical_map written above, which has already had every -1 the
-        # kernel left filled with a same-rank fallback master id (see
-        # UltraEPL3Policy.plan() in policies/l3/ultraep.py: that fallback
-        # exists so the framework's *other* dense-mapping consumers, e.g.
-        # the load-history scatter, never see -1 -- it does not describe
-        # what this specific transfer actually moved). A redundant slot the
-        # Manager declined -- most commonly because the logical expert it
-        # would have replicated is already this rank's own master, which
-        # update_placement_sparse correctly leaves unassigned rather than
-        # "replicate onto yourself" -- still reads as a plausible logical id
-        # from the plan, and copying its buffer row unconditionally silently
-        # writes stale data there: confirmed by a real GPU verification with
-        # distinctive per-expert weight values before this mask was added
-        # (see /root/yuny/l3lab/vllm_probe/scratch/
-        # verify_fast_refresh_weight_copy.py) -- 0/128 elements correct for
-        # exactly this case, no exception raised. torch.where, not a
-        # boolean-mask assignment on a chained slice, so an unassigned row
-        # provably keeps its prior value rather than depending on in-place-
-        # through-a-view semantics.
-        num_local_physical = self.num_physical_experts // self.ep_size
-        my_redundant_p2l = manager.physical_to_logical_map[layer_id][
-            self.ep_rank * num_local_physical
-            + num_local_master : (self.ep_rank + 1) * num_local_physical
-        ]
-        assigned = my_redundant_p2l >= 0
-        w13_assigned = assigned.view(-1, *([1] * (w13.dim() - 1)))
-        w2_assigned = assigned.view(-1, *([1] * (w2.dim() - 1)))
-        w13[num_local_master:].copy_(
-            torch.where(
-                w13_assigned,
-                manager.local_replica_fc1_weight_buffer.view_as(w13[num_local_master:]),
-                w13[num_local_master:],
-            )
-        )
-        w2[num_local_master:].copy_(
-            torch.where(
-                w2_assigned,
-                manager.local_replica_fc2_weight_buffer.view_as(w2[num_local_master:]),
-                w2[num_local_master:],
-            )
+        self._ultraep_transfer.transfer(
+            WeightTransferRequest(layer_id=layer_id, routing_signal=topk_ids)
         )
 
     def replica_shares(
@@ -969,7 +906,7 @@ class MlbRoutingRuntime:
         if self.consumes_global_logical_count and not self._logical_count_ready:
             return None
 
-        if self._ultraep_manager is not None:
+        if self._ultraep_transfer is not None:
             self._ultraep_fast_refresh(layer_id, topk_ids, num_unpadded_tokens)
 
         # Pass the PREVIOUS step's global count to MLB.  The stable tensor
