@@ -315,6 +315,13 @@ class MlbRoutingRuntime:
         # an explicit data bridge.
         self._ultraep_transfer: Any = None
         self._ultraep_refresh_gate: Any = None
+        # Declared here (not just where it's actually populated, in
+        # _init_ultraep_fast_refresh below) because finish_pending_
+        # ultraep_transfer() is called unconditionally from vLLM's own FFN
+        # forward for every MoE layer regardless of which L1 policy is
+        # active -- an L1 policy other than ultraep must see this attribute
+        # exist (as None) rather than raise AttributeError.
+        self._ultraep_pending_transfer: tuple[int, Any] | None = None
         self._ultraep_min_representative_tokens = int(
             os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "8")
         )
@@ -384,6 +391,18 @@ class MlbRoutingRuntime:
         self._ultraep_transfer = transfer
         interval = int(os.environ.get("MLB_ULTRAEP_REFRESH_INTERVAL", "64"))
         self._ultraep_refresh_gate = RefreshGate(interval)
+        # Experimental overlap mode (MLB_ULTRAEP_OVERLAP_TRANSFER=1): at most
+        # one issued-but-not-finished transfer at a time is a safe
+        # assumption because MoE layers execute sequentially within one
+        # forward pass -- issue happens in this layer's own routing
+        # resolution, immediately before this layer's own _forward_impl
+        # runs, and finish_pending_ultraep_transfer() below is called from
+        # inside that same forward_impl, before the next layer's routing
+        # resolution can issue a new one. Breaks under concurrent/overlapped
+        # multi-batch scheduling (DBO and similar), which this experiment
+        # does not cover. (Attribute itself is declared in __init__, not
+        # here, so it exists as None even when ultraep is not the active
+        # policy -- see that declaration's own comment.)
         logger.info(
             "UltraEP fast refresh enabled (interval=%d representative "
             "batches, min_tokens=%d, num_layers=%d, "
@@ -845,7 +864,38 @@ class MlbRoutingRuntime:
             plan.metadata["rank_quota_prefix"][0]
         )
 
-        self._ultraep_transfer.transfer(layer_id, topk_ids)
+        # Experimental: MLB_ULTRAEP_OVERLAP_TRANSFER=1 swaps transfer()'s
+        # proven-correct barrier for the issue/finish split (no barrier,
+        # matching SGLang's/Megatron's real integrations) -- issue here,
+        # finish later from finish_pending_ultraep_transfer() (called by
+        # vLLM's own FFN forward after real dispatch work has run, see
+        # modular_kernel.py). Off by default -- transfer() remains the path
+        # every prior verification and benchmark in this project used.
+        if os.environ.get("MLB_ULTRAEP_OVERLAP_TRANSFER", "0") == "1":
+            self._ultraep_pending_transfer = self._ultraep_transfer.transfer_issue(
+                layer_id, topk_ids
+            )
+            if os.environ.get("MLB_ULTRAEP_OVERLAP_DEBUG_TIMING", "0") == "1":
+                self._ultraep_pending_transfer_issued_at = time.perf_counter()
+        else:
+            self._ultraep_transfer.transfer(layer_id, topk_ids)
+
+    def finish_pending_ultraep_transfer(self) -> None:
+        """Call from vLLM's own FFN forward, after real dispatch work has
+        run, before the FFN compute reads expert weights -- the other half
+        of the overlap experiment above. No-op if overlap mode issued
+        nothing this call (interval gating, non-representative batch, decode
+        stage, or overlap mode simply being off)."""
+        token = self._ultraep_pending_transfer
+        if token is None:
+            return
+        self._ultraep_pending_transfer = None
+        if os.environ.get("MLB_ULTRAEP_OVERLAP_DEBUG_TIMING", "0") == "1":
+            issued_at = getattr(self, "_ultraep_pending_transfer_issued_at", None)
+            if issued_at is not None:
+                gap_ms = (time.perf_counter() - issued_at) * 1000
+                logger.info("MLB_ULTRAEP_OVERLAP_DEBUG: issue->finish wall-clock gap = %.3f ms", gap_ms)
+        self._ultraep_transfer.transfer_finish(token)
 
     def replica_shares(
         self,

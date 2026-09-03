@@ -1471,6 +1471,18 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
         )
 
+        # Experimental overlap mode (MLB_ULTRAEP_OVERLAP_TRANSFER=1, off by
+        # default): finish any UltraEP weight transfer issued for this layer
+        # now that real dispatch work (_prepare above) has run -- the
+        # other half lives in mlb_runtime.py's _ultraep_fast_refresh /
+        # finish_pending_ultraep_transfer. No-op (and no import cost beyond
+        # this lazy one) when MLB isn't in use or overlap mode is off.
+        from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+
+        routing = get_mlb_routing()
+        if routing is not None:
+            routing.finish_pending_ultraep_transfer()
+
         # Stash the original unquantized hidden states on the LoRA context
         # so apply_w13_lora sees correct-magnitude activations instead of
         # the potentially quantized values produced by _prepare().
