@@ -75,6 +75,24 @@ class VllmRoutingCollectives:
         return get_ep_group().all_reduce(payload)
 
 
+def _algorithm_places_with_ultraep(algorithm: str) -> bool:
+    """Whether this L2 expression puts UltraEP in charge of placement.
+
+    ``RoutingPipeline`` reports that as ``placement_policy``, which is exactly
+    the question the fast-refresh path needs answered: it owns the placement
+    solve and the weight movement that follows it, and it must run for every
+    expression UltraEP places for -- ``ultraep`` and ``ultraep+waterfill``
+    alike. An unparseable expression is not UltraEP's to claim; the caller
+    reports that separately.
+    """
+    from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+
+    try:
+        return RoutingPipeline.from_value(algorithm).placement_policy == "ultraep"
+    except Exception:
+        return False
+
+
 def _current_stage() -> str | None:
     """Map vLLM's current batch onto MLB's routing stage.
 
@@ -93,9 +111,31 @@ def _current_stage() -> str | None:
 
     if not is_forward_context_available():
         return None
-    descriptor = getattr(get_forward_context(), "batch_descriptor", None)
+    ctx = get_forward_context()
+    descriptor = getattr(ctx, "batch_descriptor", None)
     if descriptor is None:
         return None
+    # `uniform_decode_across_dp` is vLLM's own cross-rank reduction of exactly
+    # the predicate below (see `coordinate_batch_across_dp`): it is True only
+    # when *every* DP rank is decoding this step. The descriptor describes this
+    # rank alone, and under DP that is not the same question -- a rank with no
+    # requests runs a dummy decode batch while its peers prefill, so reading the
+    # descriptor makes a rank answer "decode" on a step its peers are treating
+    # as prefill. Any caller gating a collective on the result would then split
+    # the EP group. Prefer the reduced answer whenever the framework supplies
+    # one; fall back to the local predicate only where there is no DP peer that
+    # could disagree.
+    if getattr(ctx, "uniform_decode_across_dp", False):
+        return "decode"
+    if getattr(ctx, "dp_metadata", None) is not None:
+        # Under DP the reduced flag above is the only admissible answer. It is
+        # False here, so at least one rank is not decoding and every rank has
+        # to say so -- including this one, even if its own batch is a textbook
+        # decode. Falling through to the descriptor would be the split this
+        # function exists to avoid. Read off the forward context rather than
+        # the config so the "is this DP" test itself comes from the same
+        # per-step object every rank sees.
+        return "mixed"
     if (
         descriptor.uniform
         and descriptor.num_reqs is not None
@@ -104,6 +144,39 @@ def _current_stage() -> str | None:
     ):
         return "decode"
     return "mixed"
+
+
+def _dp_token_counts() -> torch.Tensor | None:
+    """Cross-rank-synchronized per-DP-rank token count for this step, if any.
+
+    vLLM computes this once per step -- real batch or dummy -- and publishes
+    it to every rank before any MoE layer's forward runs
+    (``set_forward_context(num_tokens_across_dp=...)``, both in
+    ``execute_model`` and in ``_dummy_run``). Every rank sees the identical
+    array regardless of whether it personally has real requests this step,
+    which is exactly the property ``_ultraep_fast_refresh`` needs from its
+    own "is this worth a refresh" check: reading this instead of a per-rank
+    local token count means every rank reaches the same verdict even when
+    some ranks are running a dummy batch and never see real ``topk_ids`` at
+    all. ``None`` outside DP (single rank, or TP/PP-only) -- the caller falls
+    back to a local check there, where no dummy-batch peer exists to
+    disagree with.
+    """
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return None
+    # On `dp_metadata`, not on the context itself. `set_forward_context` takes a
+    # `num_tokens_across_dp` argument but does not keep it under that name --
+    # it is consumed into DPMetadata, and ForwardContext has no such field. A
+    # getattr for it therefore always answered None, which silently sent this
+    # check down its single-rank fallback on every rank, which is exactly the
+    # cross-rank disagreement it exists to prevent. Read the tensor where it
+    # actually lives. It is a CPU tensor, so summing it costs no GPU sync.
+    dp_metadata = getattr(get_forward_context(), "dp_metadata", None)
+    if dp_metadata is None:
+        return None
+    return getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
 
 
 class MlbRoutingRuntime:
@@ -120,6 +193,8 @@ class MlbRoutingRuntime:
         physical_to_logical_map: torch.Tensor,
         balancer: object | None = None,
         expert_weights: "Any | None" = None,
+        expert_buffer: "Any | None" = None,
+        communicator: "Any | None" = None,
     ) -> None:
         from moe_load_balancer import MoELoadBalancer
 
@@ -303,17 +378,23 @@ class MlbRoutingRuntime:
         # this refresh later writes per-layer slices into do not exist
         # before its first solve -- see the None-guard in
         # _ultraep_fast_refresh), this only adds much more frequent updates
-        # on top of it. The weight transfer itself is UltraEP's own private
-        # execution detail (moe_load_balancer.policies.fused.
-        # ultraep_weight_transfer.UltraEPWeightTransfer) for making memory
-        # match a placement its L1 solve already decided -- not a general
-        # MLB protocol, since MLB has never defined one for that step; this
-        # file only solves placement and feeds it topk_ids, never touches
-        # ultra_ep's Manager directly. UltraEPL2Router (unchanged) stays the
-        # dispatch mechanism, fed by the same deterministic solve this
-        # refresh also hands the transfer backend, so the two agree without
-        # an explicit data bridge.
-        self._ultraep_transfer: Any = None
+        # on top of it. Making memory match a placement the solve decided is
+        # the framework adapter's job and stays here: the solve produces an
+        # explicit before/after map pair and hands it to EplbState's own P2P
+        # mover (_commit_placement_weights). MLB supplies the placement
+        # algorithm and nothing else -- no policy brings its own weight
+        # mover, and no second component re-derives placement from raw
+        # routing to agree with this one by construction.
+        self._ultraep_expert_weights: Any = None
+        self._ultraep_expert_buffer: Any = None
+        self._ultraep_communicator: Any = None
+        self._ultraep_num_local_physical: int | None = None
+        self._ultraep_comm_stream: Any = None
+        # Layers whose MLB-side placement tables have actually been written by
+        # a refresh. Allocation of the quota tensor is not the same event: the
+        # bootstrap solve allocates it whole, layer contents arrive one refresh
+        # at a time. See the guard in _snapshot.
+        self._ultraep_committed_layers: set[int] = set()
         self._ultraep_refresh_gate: Any = None
         # Declared here (not just where it's actually populated, in
         # _init_ultraep_fast_refresh below) because finish_pending_
@@ -321,97 +402,88 @@ class MlbRoutingRuntime:
         # forward for every MoE layer regardless of which L1 policy is
         # active -- an L1 policy other than ultraep must see this attribute
         # exist (as None) rather than raise AttributeError.
-        self._ultraep_pending_transfer: tuple[int, Any] | None = None
+        # (layer_id, transfer_metadata, new_indices, comm_stream_event)
+        self._ultraep_pending_transfer: tuple[int, Any, Any, Any] | None = None
+        self._ultraep_pending_transfer_issued_at: float | None = None
         self._ultraep_min_representative_tokens = int(
             os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "8")
         )
-        if algorithm == "ultraep" and expert_weights is not None:
-            self._init_ultraep_fast_refresh(expert_weights)
+        # Parsed, not compared as a string. `algorithm` is the whole L2
+        # expression, so an equality test here silently misses every
+        # composition that merely *contains* ultraep -- `ultraep+waterfill`
+        # among them. The failure was not a graceful degradation: the refresh
+        # never ran, while `_snapshot` still saw an allocated quota and routed
+        # through it, so tokens went to slots holding other experts. Everywhere
+        # else in this file already asks the parsed pipeline (see
+        # l2_pipeline_capabilities / l2_inapplicable_reason); this was the one
+        # place that did not.
+        if _algorithm_places_with_ultraep(algorithm) and expert_weights is not None:
+            self._init_ultraep_fast_refresh(expert_weights, expert_buffer, communicator)
 
-    def _init_ultraep_fast_refresh(self, expert_weights: Any) -> None:
-        """One-time setup: hand UltraEP's own weight-transfer backend this
-        rank's own master expert weights so it has real memory to move data
-        between.
+    def _init_ultraep_fast_refresh(
+        self,
+        expert_weights: Any,
+        expert_buffer: Any,
+        communicator: Any,
+    ) -> None:
+        """One-time setup for the traffic-driven placement refresh.
 
-        Eager, not lazy like the SGLang reference's ``UltraEPExpertTransfer``
-        (which registers on its *first* transfer() call, because the object
-        that owns it there is constructed before weights are loaded): vLLM
-        hands this runtime ``model.expert_weights`` at the same call site
-        that constructs it, so there is no "not loaded yet" window to defer
-        past.
+        Holds on to the model's own expert weight tensors plus ``EplbState``'s
+        staging buffer and P2P communicator -- the same three things vLLM's own
+        periodic rearrangement moves weight with. This policy re-plans placement
+        far more often than that cadence, but it re-plans it into the same
+        memory using the same machinery; it brings no mover of its own.
 
-        Assumes exactly two per-layer weight tensors (fc1/w13-fused, then
-        fc2/w2), each shaped ``[num_local_physical_experts, ...]`` -- true
-        for the unquantized case this was verified against. A model whose
-        ``expert_weights`` also carries separate quantization-scale tensors
-        needs ``UltraEPWeightTransfer.register_weights`` to grow scale
-        support; not attempted here.
+        Weights are taken eagerly rather than on first use: vLLM hands this
+        runtime ``model.expert_weights`` at the same call site that constructs
+        it, so there is no "not loaded yet" window to defer past.
+
+        Assumes the per-layer weight tensors are each shaped
+        ``[num_local_physical_experts, ...]`` -- true for the unquantized case
+        this was verified against. A model whose ``expert_weights`` also carries
+        separate quantization-scale tensors would need those moved too; not
+        attempted here.
         """
-        try:
-            import ultra_ep  # noqa: F401 -- import-only probe, see below.
-        except ImportError:
+        if expert_buffer is None or communicator is None:
             logger.warning_once(
-                "ultraep fast refresh requires the ultra_ep package (not "
-                "installed); staying on the slow EplbState.rearrange() "
-                "cadence only."
+                "ultraep fast refresh needs EplbState's expert buffer and "
+                "communicator to move weight; neither was supplied, so the "
+                "policy stays on the slow EplbState.rearrange() cadence only."
             )
             return
 
-        # Probed above, before get_ep_group(): a caller-side check, not
-        # register_weights()'s own -- that one still does its own `from
-        # ultra_ep import Manager` internally (the actual point of use, and
-        # the right behavior for a caller that skips this pre-check). This
-        # one exists only so a process_group=get_ep_group().device_group
-        # argument -- evaluated eagerly, before register_weights's body ever
-        # runs -- is never computed when ultra_ep is not installed. A test
-        # environment with no real EP process group but no ultra_ep either
-        # (test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep)
-        # depends on this ordering: get_ep_group() would assert before
-        # register_weights() got a chance to raise ImportError.
-        from moe_load_balancer.policies.fused.ultraep_weight_transfer import (
-            UltraEPWeightTransfer,
-        )
-        from vllm.distributed import get_ep_group
-
-        num_local_master = self.num_logical_experts // self.ep_size
-        num_local_physical = self.num_physical_experts // self.ep_size
-        num_local_redundant = num_local_physical - num_local_master
-
-        transfer = UltraEPWeightTransfer()
-        transfer.register_weights(
-            expert_weights,
-            ep_size=self.ep_size,
-            num_local_master_experts=num_local_master,
-            num_local_redundant_experts=num_local_redundant,
-            process_group=get_ep_group().device_group,
-        )
-
         from moe_load_balancer import RefreshGate
 
-        self._ultraep_transfer = transfer
+        self._ultraep_expert_weights = expert_weights
+        self._ultraep_expert_buffer = expert_buffer
+        self._ultraep_communicator = communicator
+        self._ultraep_num_local_physical = self.num_physical_experts // self.ep_size
+        # Only ever used by overlap mode, but allocated unconditionally: a CUDA
+        # stream is cheap, and creating one lazily inside the refresh would put
+        # the allocation on the first refresh's critical path.
+        self._ultraep_comm_stream = torch.cuda.Stream()
+
         interval = int(os.environ.get("MLB_ULTRAEP_REFRESH_INTERVAL", "64"))
         self._ultraep_refresh_gate = RefreshGate(interval)
         # Experimental overlap mode (MLB_ULTRAEP_OVERLAP_TRANSFER=1): at most
-        # one issued-but-not-finished transfer at a time is a safe
-        # assumption because MoE layers execute sequentially within one
-        # forward pass -- issue happens in this layer's own routing
-        # resolution, immediately before this layer's own _forward_impl
-        # runs, and finish_pending_ultraep_transfer() below is called from
-        # inside that same forward_impl, before the next layer's routing
-        # resolution can issue a new one. Breaks under concurrent/overlapped
-        # multi-batch scheduling (DBO and similar), which this experiment
-        # does not cover. (Attribute itself is declared in __init__, not
-        # here, so it exists as None even when ultraep is not the active
-        # policy -- see that declaration's own comment.)
+        # one issued-but-not-finished transfer at a time is a safe assumption
+        # because MoE layers execute sequentially within one forward pass --
+        # issue happens in this layer's own routing resolution, immediately
+        # before this layer's own _forward_impl runs, and
+        # finish_pending_ultraep_transfer() is called from inside that same
+        # forward_impl, before the next layer's routing resolution can issue a
+        # new one. Breaks under concurrent/overlapped multi-batch scheduling
+        # (DBO and similar), which this experiment does not cover. (Attribute
+        # itself is declared in __init__, not here, so it exists as None even
+        # when ultraep is not the active policy -- see that declaration.)
         logger.info(
             "UltraEP fast refresh enabled (interval=%d representative "
             "batches, min_tokens=%d, num_layers=%d, "
-            "num_local_master=%d, num_local_redundant=%d)",
+            "num_local_physical=%d)",
             interval,
             self._ultraep_min_representative_tokens,
             len(expert_weights),
-            num_local_master,
-            num_local_redundant,
+            self._ultraep_num_local_physical,
         )
 
     def finalize_step_counts(self) -> None:
@@ -517,7 +589,17 @@ class MlbRoutingRuntime:
 
         defaults = self._default_replicas
         quota = self._ultraep_rank_quota_prefix
-        if quota is not None:
+        # Allocated is not the same as committed. The bootstrap solve allocates
+        # the whole quota tensor before any refresh has run, and what it leaves
+        # in it describes a layout vLLM never applied -- all-zero quota,
+        # single-replica counts, candidates pointing at slots that hold other
+        # experts. Routing through that is worse than not routing at all: it
+        # sends tokens to the wrong expert instead of falling back. So the
+        # MLB-side tables are used only for layers a refresh has actually
+        # written; every other layer takes the framework's own candidates, which
+        # is the same path a non-UltraEP policy takes and is always consistent
+        # with physical_to_logical_map.
+        if quota is not None and layer_id in self._ultraep_committed_layers:
             # The quota's replica columns are only meaningful against the
             # candidate table MLB solved them from -- not vLLM's own
             # candidates, independently rebuilt from physical_to_logical_map
@@ -782,14 +864,15 @@ class MlbRoutingRuntime:
         separate "pending" representation could go stale relative to what
         this just wrote.
 
-        The placement solve above is this file's own (MLB's L1, through
-        ``self._mlb.plan_placement``); physically moving weight data to
-        match it is UltraEP's own private execution detail
-        (``moe_load_balancer.policies.fused.ultraep_weight_transfer.
-        UltraEPWeightTransfer``, constructed in
-        ``_init_ultraep_fast_refresh``) -- this method hands it the same
-        ``topk_ids`` the solve above was seeded from and nothing else, so
-        the two agree without an explicit data bridge.
+        The placement solve is this file's own (MLB's L1, through
+        ``self._mlb.plan_placement``); physically moving weight data to match
+        it is ``_commit_placement_weights`` below, over ``EplbState``'s own P2P
+        mover. The bridge between the two is explicit and is the solve's actual
+        output: the before/after physical-to-logical map pair. No second
+        component re-derives placement from raw routing to arrive at the same
+        answer independently, so there is no shared-determinism assumption to
+        hold -- the mover cannot disagree with the solve, because it is handed
+        the solve.
         """
         if torch.cuda.is_current_stream_capturing():
             return
@@ -803,11 +886,25 @@ class MlbRoutingRuntime:
             # count toward this layer's refresh interval at all -- it never
             # reaches is_due(), the same way SGLang's gate never touches its
             # own batch counter for a rejected stage.
+            #
+            # Everything past this point issues collectives, so this verdict
+            # has to be identical on every EP rank or the ranks that continue
+            # will wait in the all_gather below for ranks that returned here.
+            # That is what `_current_stage()` reads the DP-reduced
+            # `uniform_decode_across_dp` for rather than this rank's own batch
+            # descriptor: a rank with no requests runs `execute_dummy_batch()`
+            # -- `_dummy_run(uniform_decode=True)`, locally a perfect "decode"
+            # -- while its peers run real prefill. Gating on the local view
+            # splits the group, and permanently desynchronises is_due()'s
+            # per-layer counter as well, since a rank that returns here never
+            # advances it.
             return
 
         # is_due() is pure Python counter bookkeeping -- no GPU access, never
         # syncs -- and is always cheap to call. Computing `representative`
-        # below is not: num_unpadded_tokens.item() is a real CPU-GPU sync,
+        # below is not free either: the fallback source is a device tensor and
+        # its `.item()` is a real CPU-GPU sync (the DP source is a CPU tensor
+        # and is not),
         # and paying it on every one of interval-1-out-of-interval calls
         # where should_refresh could not possibly say yes anyway is exactly
         # the class of per-forward cost this file goes to real lengths to
@@ -817,11 +914,25 @@ class MlbRoutingRuntime:
         if not self._ultraep_refresh_gate.is_due(layer_id):
             return
 
-        representative = (
-            num_unpadded_tokens is not None
-            and int(num_unpadded_tokens.item())
-            >= self._ultraep_min_representative_tokens
-        )
+        # Under DP, this rank's own num_unpadded_tokens says nothing about
+        # what its peers are doing this step -- a rank running a dummy batch
+        # has no local token count at all, and would otherwise have to guess.
+        # dp_counts is the same array on every rank (vLLM's own DP
+        # coordination gathers it before any MoE layer runs), so summing it
+        # gives every rank -- real or dummy -- an identical verdict. Only
+        # fall back to the local, per-rank count outside DP, where no dummy
+        # peer exists that could disagree with it.
+        dp_counts = _dp_token_counts()
+        if dp_counts is not None:
+            representative = (
+                int(dp_counts.sum().item()) >= self._ultraep_min_representative_tokens
+            )
+        else:
+            representative = (
+                num_unpadded_tokens is not None
+                and int(num_unpadded_tokens.item())
+                >= self._ultraep_min_representative_tokens
+            )
         if not self._ultraep_refresh_gate.should_refresh(
             layer_id, representative=representative
         ):
@@ -855,7 +966,19 @@ class MlbRoutingRuntime:
         # so the plan's own layer index is always 0 regardless of layer_id --
         # layer_id only selects where in *our* whole-model buffers this one
         # layer's slice of the plan lands.
-        self.physical_to_logical_map[layer_id].copy_(plan.physical_to_logical_map[0])
+        #
+        # Where each physical slot's weight lives now, and where the solve wants
+        # it to live. Those two rows *are* the transfer plan handed to the mover
+        # below -- nothing re-derives placement from raw routing a second time,
+        # so the mover cannot disagree with the solve. Stacked into one tensor
+        # because the mover reads them on the host: one device-to-host copy for
+        # the pair rather than one each, and the sync is visible here, at the
+        # only place in this path that pays it.
+        live = self.physical_to_logical_map[layer_id]
+        solved = plan.physical_to_logical_map[0]
+        placement_change = torch.stack((live, solved.to(live.dtype))).cpu().numpy()
+
+        self.physical_to_logical_map[layer_id].copy_(solved)
         self._ultraep_logical_to_physical[layer_id].copy_(
             plan.logical_to_all_physical_map[0]
         )
@@ -863,22 +986,122 @@ class MlbRoutingRuntime:
         self._ultraep_rank_quota_prefix[layer_id].copy_(
             plan.metadata["rank_quota_prefix"][0]
         )
+        # All four tables for this layer now describe the same solve, and the
+        # weight move below makes memory match it. Only from here is it sound
+        # for _snapshot to route through them.
+        self._ultraep_committed_layers.add(layer_id)
 
-        # Experimental: MLB_ULTRAEP_OVERLAP_TRANSFER=1 swaps transfer()'s
-        # proven-correct barrier for the issue/finish split (no barrier,
-        # matching SGLang's/Megatron's real integrations) -- issue here,
-        # finish later from finish_pending_ultraep_transfer() (called by
-        # vLLM's own FFN forward after real dispatch work has run, see
-        # modular_kernel.py). Off by default -- transfer() remains the path
-        # every prior verification and benchmark in this project used.
-        if os.environ.get("MLB_ULTRAEP_OVERLAP_TRANSFER", "0") == "1":
-            self._ultraep_pending_transfer = self._ultraep_transfer.transfer_issue(
-                layer_id, topk_ids
-            )
+        self._commit_placement_weights(
+            layer_id, placement_change[0], placement_change[1]
+        )
+
+    def _commit_placement_weights(
+        self,
+        layer_id: int,
+        old_np: Any,
+        new_np: Any,
+    ) -> None:
+        """Move expert weight so this layer's memory matches the placement the
+        solve just decided.
+
+        Both arrays are logical-expert ids per physical slot, EP-wide -- exactly
+        the pair ``EplbState`` hands its own periodic rearrangement, so this is
+        that same P2P move driven at this policy's cadence instead of at the
+        rearrangement interval. ``move_to_buffer`` is the half that talks to
+        other ranks; ``move_from_buffer`` is the local copy that lands the
+        result. Keeping them separate is what lets the remote half overlap real
+        work (see the overlap branch below).
+        """
+        if (old_np == new_np).all():
+            # The solve landed on the placement already in memory. Nothing to
+            # move, and skipping is safe for the EP group precisely because
+            # every rank compares the same two EP-wide arrays and so reaches
+            # this the same way.
+            return
+
+        from vllm.distributed.eplb.rebalance_execute import move_to_buffer
+
+        overlap = os.environ.get("MLB_ULTRAEP_OVERLAP_TRANSFER", "0") == "1"
+        # Overlap mode runs the remote half on its own stream so it proceeds
+        # while the caller goes on to route and dispatch this same layer --
+        # UltraEP's own pipeline puts weight distribution on a comm stream
+        # beside the reroute for exactly this reason, and vLLM's own async
+        # rearrangement worker overlaps the identical primitives the identical
+        # way (a dedicated stream handed to the communicator via set_stream).
+        # It is only ever an overlap: the landing half still waits on the event
+        # recorded here, so the FFN never reads a half-moved expert.
+        #
+        # Ordering: the comm stream must not start overwriting the staging
+        # buffer until the previous landing half -- enqueued on the compute
+        # stream -- has finished reading it. wait_stream establishes that edge.
+        stream = self._ultraep_comm_stream if overlap else None
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream())
+        self._ultraep_communicator.set_stream(stream)
+        try:
+            with torch.cuda.stream(stream):
+                metadata = move_to_buffer(
+                    num_local_experts=self._ultraep_num_local_physical,
+                    old_indices=old_np,
+                    new_indices=new_np,
+                    expert_weights=self._ultraep_expert_weights[layer_id],
+                    expert_weights_buffers=self._ultraep_expert_buffer,
+                    cuda_stream=stream,
+                    ep_rank=self.ep_rank,
+                    communicator=self._ultraep_communicator,
+                    layer_idx=layer_id,
+                )
+        finally:
+            # Left as this runtime found it: the communicator is EplbState's,
+            # shared with its own periodic rearrangement.
+            self._ultraep_communicator.set_stream(None)
+
+        done = None
+        if stream is not None:
+            done = torch.cuda.Event()
+            done.record(stream)
+
+        pending = (layer_id, metadata, new_np, done)
+        if overlap:
+            stale = self._ultraep_pending_transfer
+            if stale is not None:
+                # One slot is enough only while MoE layers run strictly in
+                # sequence and every issue is followed by its own finish (see
+                # _init_ultraep_fast_refresh). If that ever stops holding, the
+                # staging buffer this issue is about to reuse still holds the
+                # previous layer's data: land it rather than drop it, and say
+                # so, instead of silently leaving that layer's weight unmoved.
+                logger.warning_once(
+                    "ultraep overlap: layer %d issued a transfer while layer "
+                    "%d's was still pending -- landing the older one first. "
+                    "The one-pending-transfer assumption does not hold under "
+                    "this scheduling.",
+                    layer_id,
+                    stale[0],
+                )
+                self._ultraep_pending_transfer = None
+                self._land_placement_weights(stale)
+            self._ultraep_pending_transfer = pending
             if os.environ.get("MLB_ULTRAEP_OVERLAP_DEBUG_TIMING", "0") == "1":
                 self._ultraep_pending_transfer_issued_at = time.perf_counter()
         else:
-            self._ultraep_transfer.transfer(layer_id, topk_ids)
+            self._land_placement_weights(pending)
+
+    def _land_placement_weights(self, pending: tuple[int, Any, Any, Any]) -> None:
+        from vllm.distributed.eplb.rebalance_execute import move_from_buffer
+
+        layer_id, metadata, new_np, done = pending
+        if done is not None:
+            # Stream-ordered, not a host block: the compute stream queues behind
+            # the transfer rather than the CPU stalling on it.
+            torch.cuda.current_stream().wait_event(done)
+        move_from_buffer(
+            expert_weights=self._ultraep_expert_weights[layer_id],
+            expert_weights_buffers=self._ultraep_expert_buffer,
+            transfer_metadata=metadata,
+            new_indices=new_np,
+            ep_rank=self.ep_rank,
+        )
 
     def finish_pending_ultraep_transfer(self) -> None:
         """Call from vLLM's own FFN forward, after real dispatch work has
@@ -886,16 +1109,20 @@ class MlbRoutingRuntime:
         of the overlap experiment above. No-op if overlap mode issued
         nothing this call (interval gating, non-representative batch, decode
         stage, or overlap mode simply being off)."""
-        token = self._ultraep_pending_transfer
-        if token is None:
+        pending = self._ultraep_pending_transfer
+        if pending is None:
             return
         self._ultraep_pending_transfer = None
         if os.environ.get("MLB_ULTRAEP_OVERLAP_DEBUG_TIMING", "0") == "1":
             issued_at = getattr(self, "_ultraep_pending_transfer_issued_at", None)
             if issued_at is not None:
                 gap_ms = (time.perf_counter() - issued_at) * 1000
-                logger.info("MLB_ULTRAEP_OVERLAP_DEBUG: issue->finish wall-clock gap = %.3f ms", gap_ms)
-        self._ultraep_transfer.transfer_finish(token)
+                logger.info(
+                    "MLB_ULTRAEP_OVERLAP_DEBUG: issue->finish wall-clock gap "
+                    "= %.3f ms",
+                    gap_ms,
+                )
+        self._land_placement_weights(pending)
 
     def replica_shares(
         self,
@@ -960,7 +1187,7 @@ class MlbRoutingRuntime:
         if self.consumes_global_logical_count and not self._logical_count_ready:
             return None
 
-        if self._ultraep_transfer is not None:
+        if self._ultraep_expert_weights is not None:
             self._ultraep_fast_refresh(layer_id, topk_ids, num_unpadded_tokens)
 
         # Pass the PREVIOUS step's global count to MLB.  The stable tensor
@@ -1266,6 +1493,8 @@ def init_mlb_routing(
     logical_replica_count: torch.Tensor,
     rearranges: bool = False,
     expert_weights: Any | None = None,
+    expert_buffer: Any | None = None,
+    communicator: Any | None = None,
 ) -> MlbRoutingRuntime | None:
     """Create the routing runtime for a configured L2 algorithm.
 
@@ -1275,9 +1504,13 @@ def init_mlb_routing(
     what makes that decision binding.
 
     ``expert_weights`` is the model's own ``expert_weights`` (one entry per
-    MoE layer, present at this same call site) -- only ``ultraep`` reads it,
-    to register real weight pointers with its transfer runtime. Every other
-    algorithm ignores it, so it is safe to leave unset.
+    MoE layer, present at this same call site); ``expert_buffer`` and
+    ``communicator`` are ``EplbState``'s own staging buffer and P2P backend
+    for moving expert weight between ranks. Only ``ultraep`` reads them -- it
+    is the one policy that re-plans placement often enough to need weight
+    moved mid-run rather than at the rearrangement cadence -- and it moves it
+    with this framework machinery rather than any of its own. Every other
+    algorithm ignores all three, so they are safe to leave unset.
     """
     global _runtime
     if not algorithm:
@@ -1291,6 +1524,8 @@ def init_mlb_routing(
         num_physical_experts=num_physical_experts,
         physical_to_logical_map=physical_to_logical_map,
         expert_weights=expert_weights,
+        expert_buffer=expert_buffer,
+        communicator=communicator,
     )
     _runtime.register_logical_maps(logical_to_physical_map, logical_replica_count)
     # Keyed on the declared stability of the policy's state, not on whether it

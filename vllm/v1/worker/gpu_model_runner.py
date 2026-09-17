@@ -4094,8 +4094,16 @@ class GPUModelRunner(
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
+        # Outside DP this rank is the only rank: its own view of its batch is
+        # by definition the global one, and no peer can disagree with it.
+        uniform_decode_across_dp = uniform_decode
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+            (
+                should_ubatch,
+                num_tokens_across_dp,
+                synced_cudagraph_mode,
+                uniform_decode_across_dp,
+            ) = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
                     parallel_config=self.parallel_config,
@@ -4134,6 +4142,7 @@ class GPUModelRunner(
             should_ubatch,
             num_tokens_across_dp,
             cudagraph_stats,
+            uniform_decode_across_dp,
         )
 
     def _register_layerwise_nvtx_hooks(self) -> None:
@@ -4358,6 +4367,7 @@ class GPUModelRunner(
                 should_ubatch,
                 num_tokens_across_dp,
                 cudagraph_stats,
+                uniform_decode_across_dp,
             ) = self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs,
@@ -4520,6 +4530,7 @@ class GPUModelRunner(
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
+                uniform_decode_across_dp=uniform_decode_across_dp,
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
@@ -6007,7 +6018,14 @@ class GPUModelRunner(
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
-        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
+        (
+            _cudagraph_mode,
+            batch_desc,
+            should_ubatch,
+            num_tokens_across_dp,
+            _,
+            uniform_decode_across_dp,
+        ) = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs,
@@ -6227,7 +6245,14 @@ class GPUModelRunner(
             # async placement commits (rank-local, so asymmetry there cannot
             # deadlock) and fills the unpadded-token tensors, which a dummy
             # batch has no use for.
-            if self.eplb_state is not None:
+            #
+            # Gated on skip_eplb the same way eplb_step() below is: it is
+            # True for _warmup_and_capture()'s dummy runs (CUDA graph capture
+            # warmup), where every rank captures independently -- there is no
+            # synchronized peer step for this replay to stay in order with,
+            # so issuing it would be the asymmetric call, not the missing
+            # one.
+            if not skip_eplb and self.eplb_state is not None:
                 from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
 
                 routing = get_mlb_routing()
@@ -6247,6 +6272,7 @@ class GPUModelRunner(
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
                     num_tokens_across_dp=num_tokens_across_dp,
+                    uniform_decode_across_dp=uniform_decode_across_dp,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,

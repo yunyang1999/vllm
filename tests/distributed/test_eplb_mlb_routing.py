@@ -92,14 +92,13 @@ def test_every_replica_policy_resolves_ids_rather_than_going_silent():
     assert ids is not None and ids.shape == logical.shape
 
 
-def test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep(monkeypatch):
-    """ultra_ep is an optional runtime dependency (real weight streaming);
-    its absence must not break placement/routing, only skip the fast-refresh
-    path and fall back to the slow EplbState.rearrange() cadence alone."""
-    import sys
-
-    monkeypatch.setitem(sys.modules, "ultra_ep", None)
-
+def test_ultraep_fast_refresh_degrades_gracefully_without_a_mover():
+    """The refresh makes memory match the placement it solves by moving expert
+    weight with ``EplbState``'s own staging buffer and P2P communicator. A
+    caller that does not supply them has given the policy nothing to move
+    weight with, so the fast-refresh path must stay off and leave placement and
+    routing working on the slow rearrange cadence alone -- not fail, and not
+    half-enable itself."""
     num_local_physical = NUM_PHYSICAL // EP_SIZE
     expert_weights = [
         [torch.zeros(num_local_physical, 8, 8), torch.zeros(num_local_physical, 8, 8)]
@@ -115,8 +114,11 @@ def test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep(monkeypatch):
         num_physical_experts=NUM_PHYSICAL,
         physical_to_logical_map=phy2log,
         expert_weights=expert_weights,
+        # expert_buffer / communicator deliberately omitted.
     )
-    assert rt._ultraep_transfer is None
+    assert rt._ultraep_expert_weights is None
+    assert rt._ultraep_communicator is None
+    assert rt._ultraep_refresh_gate is None
 
     # Routing must still work normally -- the fast-refresh path is purely
     # additive, so its absence must be silent, not a degraded dispatch.
@@ -135,16 +137,9 @@ def test_ultraep_fast_refresh_degrades_gracefully_without_ultra_ep(monkeypatch):
 def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
     """UltraEP is a prefill-time algorithm (the paper's own scoping; SGLang's
     reference should_refresh gates the same way, rejecting only its provable
-    "decode" stage). A decode-only batch must return before touching the
-    refresh gate's counter or attempting any collective/transfer work."""
-    import sys
-
+    "decode" stage). A decode batch must return before touching the refresh
+    gate's counter or moving any weight."""
     import vllm.distributed.eplb.mlb_runtime as mlb_runtime
-
-    # Real Manager construction needs a real EP process group, which this
-    # unit test does not set up -- disable ultra_ep so __init__ leaves
-    # _ultraep_transfer None, then override it with the exploding stub below.
-    monkeypatch.setitem(sys.modules, "ultra_ep", None)
 
     num_local_physical = NUM_PHYSICAL // EP_SIZE
     expert_weights = [
@@ -162,20 +157,169 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
         expert_weights=expert_weights,
     )
 
-    # Force the gate open -- a real weight transfer and pre-existing quota
-    # buffers, so a non-decode call would proceed into real
-    # collective/transfer work. A decode-stage call must never reach it:
-    # the stub raises if it does.
-    class _ExplodingTransfer:
-        def transfer(self, layer_id, topk_ids):
-            raise AssertionError("must not be called for a decode-stage batch")
+    # Force the gate open -- pre-existing quota buffers, so a non-decode call
+    # would proceed into real collective and weight-move work. A decode-stage
+    # call must never reach it: the stub raises if it does.
+    def _explode(*args, **kwargs):
+        raise AssertionError("must not move weight for a decode-stage batch")
 
-    rt._ultraep_transfer = _ExplodingTransfer()
+    monkeypatch.setattr(rt, "_commit_placement_weights", _explode)
     rt._ultraep_rank_quota_prefix = torch.zeros(NUM_LAYERS, NUM_LOGICAL, EP_SIZE)
     monkeypatch.setattr(mlb_runtime, "_current_stage", lambda: "decode")
 
     topk_ids = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
     rt._ultraep_fast_refresh(0, topk_ids, num_unpadded_tokens=None)
+
+
+def test_current_stage_under_dp_ignores_this_ranks_own_decode_shape(monkeypatch):
+    """Everything the refresh does past its stage check issues a collective, so
+    the check has to reach the same verdict on every EP rank. Under DP it does
+    not: a rank with no requests runs `_dummy_run(uniform_decode=True)` and
+    looks like a textbook decode to itself while its peers run real prefill.
+    Answering "decode" off this rank's own descriptor is what splits the group,
+    so the DP-reduced flag wins and a locally-decode-shaped batch still reports
+    "mixed" when its peers are not decoding."""
+    import vllm.distributed.eplb.mlb_runtime as mlb_runtime
+    from vllm.forward_context import BatchDescriptor
+
+    class _Ctx:
+        # Shaped exactly like a decode to this rank, and vLLM's cross-rank
+        # reduction says not every rank agrees.
+        batch_descriptor = BatchDescriptor(num_tokens=4, num_reqs=4, uniform=True)
+        uniform_decode_across_dp = False
+        dp_metadata = object()
+
+    monkeypatch.setattr(mlb_runtime, "is_forward_context_available", lambda: True, raising=False)
+    monkeypatch.setattr(
+        "vllm.forward_context.is_forward_context_available", lambda: True
+    )
+    monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: _Ctx())
+    assert mlb_runtime._current_stage() == "mixed"
+
+    # And when every rank really is decoding, all of them say so together.
+    _Ctx.uniform_decode_across_dp = True
+    assert mlb_runtime._current_stage() == "decode"
+
+
+def test_dp_token_counts_reads_the_tensor_that_actually_exists():
+    """The cross-rank token count is the input that makes every rank agree on
+    whether a batch is worth refreshing for, so reading it has to actually
+    return it.
+
+    It lives on `DPMetadata.num_tokens_across_dp_cpu`. `set_forward_context`
+    accepts an argument called `num_tokens_across_dp`, but does not keep a field
+    by that name -- it is consumed into DPMetadata. Asking the context for it
+    directly returned None on every rank, which silently routed this check to
+    its single-rank fallback everywhere, i.e. produced precisely the per-rank
+    disagreement it exists to prevent, while looking like a working fix. The
+    assertion that matters here is simply that it is not None."""
+    from vllm.distributed.eplb.mlb_runtime import _dp_token_counts
+    from vllm.forward_context import DPMetadata, ForwardContext
+
+    counts = torch.tensor([4096, 0, 0, 0], dtype=torch.int32)
+
+    class _Ctx:
+        dp_metadata = DPMetadata(num_tokens_across_dp_cpu=counts)
+
+    import vllm.forward_context as fc
+
+    saved_avail, saved_get = fc.is_forward_context_available, fc.get_forward_context
+    try:
+        fc.is_forward_context_available = lambda: True
+        fc.get_forward_context = lambda: _Ctx()
+        got = _dp_token_counts()
+        assert got is not None, (
+            "_dp_token_counts returned None with DP metadata present -- the "
+            "cross-rank check has silently degraded to a per-rank one"
+        )
+        assert torch.equal(got, counts)
+        assert int(got.sum()) == 4096
+
+        # No DP: nothing to read, and the caller's local fallback is correct
+        # there because no peer exists to disagree with it.
+        class _NoDp:
+            dp_metadata = None
+
+        fc.get_forward_context = lambda: _NoDp()
+        assert _dp_token_counts() is None
+    finally:
+        fc.is_forward_context_available = saved_avail
+        fc.get_forward_context = saved_get
+
+
+def test_ultraep_fast_refresh_arms_for_composed_expressions():
+    """`VLLM_MLB_L2_ALGORITHM` carries a whole pipeline expression, not a bare
+    policy name. UltraEP owns placement in every expression it appears as the
+    placement policy of -- `ultraep` and `ultraep+waterfill` alike -- and the
+    refresh has to arm for all of them.
+
+    It used to be selected by `algorithm == "ultraep"`, so any composition
+    silently disarmed it, and the failure was not graceful: `_snapshot` still
+    saw an allocated quota tensor and routed through placement tables no
+    refresh had ever written."""
+    from vllm.distributed.eplb.mlb_runtime import _algorithm_places_with_ultraep
+
+    assert _algorithm_places_with_ultraep("ultraep")
+    assert _algorithm_places_with_ultraep("ultraep+waterfill")
+    assert not _algorithm_places_with_ultraep("lplb")
+    assert not _algorithm_places_with_ultraep("static")
+    assert not _algorithm_places_with_ultraep("waterfill")
+    # Unparseable is not UltraEP's to claim, and must not raise here.
+    assert not _algorithm_places_with_ultraep("not-a-policy")
+
+
+def test_snapshot_ignores_uncommitted_ultraep_tables():
+    """Allocating the quota tensor and filling a layer's slice are different
+    events: the bootstrap solve does the first for the whole model, a refresh
+    does the second one layer at a time. Between them the MLB-side tables
+    describe a layout the framework never applied, so routing through them
+    sends tokens to slots holding other experts. Until a layer is committed,
+    the snapshot must hand back the framework's own candidates instead."""
+    num_local_physical = NUM_PHYSICAL // EP_SIZE
+    expert_weights = [
+        [torch.zeros(num_local_physical, 8, 8), torch.zeros(num_local_physical, 8, 8)]
+        for _ in range(NUM_LAYERS)
+    ]
+    phy2log = _placement()
+    rt = MlbRoutingRuntime(
+        "ultraep",
+        ep_size=EP_SIZE,
+        ep_rank=0,
+        num_logical_experts=NUM_LOGICAL,
+        num_physical_experts=NUM_PHYSICAL,
+        physical_to_logical_map=phy2log,
+        expert_weights=expert_weights,
+    )
+    log2phy, replica_count = compute_logical_maps(phy2log, NUM_LOGICAL)
+    rt.register_logical_maps(log2phy, replica_count)
+    state = _layer_state(rt)
+
+    # Quota allocated whole, as the bootstrap solve leaves it, and deliberately
+    # inconsistent with the committed placement -- exactly the state that made
+    # the real failure route 90% of tokens to the wrong expert.
+    rt._ultraep_rank_quota_prefix = torch.zeros(NUM_LAYERS, NUM_LOGICAL, EP_SIZE)
+    rt._ultraep_logical_to_physical = torch.zeros(
+        NUM_LAYERS, NUM_LOGICAL, EP_SIZE, dtype=torch.int64
+    )
+    rt._ultraep_replica_counts = torch.ones(
+        NUM_LAYERS, NUM_LOGICAL, dtype=torch.int64
+    )
+    assert rt._ultraep_committed_layers == set()
+
+    snap = rt._snapshot(state, 0)
+    # Uncommitted: the framework's candidates, which always agree with
+    # physical_to_logical_map.
+    assert torch.equal(
+        snap.logical_to_physical_candidates,
+        state.logical_to_physical_map[:, : rt._max_replicas],
+    )
+
+    # Committed: MLB's own tables win, which is the whole point of the branch.
+    rt._ultraep_committed_layers.add(0)
+    snap = rt._snapshot(state, 0)
+    assert torch.equal(
+        snap.logical_to_physical_candidates, rt._ultraep_logical_to_physical[0]
+    )
 
 
 def test_synthesized_default_prefers_local_replicas():
@@ -317,9 +461,16 @@ def test_ultraep_quota_and_candidates_reach_the_snapshot_only_when_set():
         baseline.logical_to_physical_candidates, rt._logical_to_physical_map[0]
     )
 
-    # plan_placement() stashes the whole per-layer tensors; _snapshot() must
-    # slice each by the layer actually being routed, and must prefer MLB's
-    # own candidate table over vLLM's once a solve has produced one.
+    # A refresh stashes the whole per-layer tensors and commits the layer it
+    # wrote; _snapshot() must slice each by the layer actually being routed,
+    # and must prefer MLB's own candidate table over vLLM's for those layers.
+    #
+    # Committing is a separate step from stashing on purpose: the bootstrap
+    # solve allocates these tensors for the whole model before any refresh has
+    # written a layer, and what it leaves in them describes a placement the
+    # framework never applied. Routing through that sends tokens to slots
+    # holding other experts, so an uncommitted layer falls back instead --
+    # covered by test_snapshot_ignores_uncommitted_ultraep_tables.
     quota = torch.arange(NUM_LAYERS * 3 * 5, dtype=torch.int32).reshape(
         NUM_LAYERS, 3, 5
     )
@@ -331,6 +482,7 @@ def test_ultraep_quota_and_candidates_reach_the_snapshot_only_when_set():
     rt._ultraep_rank_quota_prefix = quota
     rt._ultraep_logical_to_physical = candidates
     rt._ultraep_replica_counts = counts
+    rt._ultraep_committed_layers = set(range(NUM_LAYERS))
     for layer_id in range(NUM_LAYERS):
         snapshot = rt._snapshot(state, layer_id)
         assert torch.equal(snapshot.metadata["rank_quota_prefix"], quota[layer_id])
