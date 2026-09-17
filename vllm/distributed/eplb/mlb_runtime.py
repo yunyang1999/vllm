@@ -400,7 +400,6 @@ class MlbRoutingRuntime:
         self._ultraep_expert_buffer: Any = None
         self._ultraep_communicator: Any = None
         self._ultraep_num_local_physical: int | None = None
-        self._ultraep_comm_stream: Any = None
         # Layers whose MLB-side placement tables have actually been written by
         # a refresh. Allocation of the quota tensor is not the same event: the
         # bootstrap solve allocates it whole, layer contents arrive one refresh
@@ -413,9 +412,6 @@ class MlbRoutingRuntime:
         # forward for every MoE layer regardless of which L1 policy is
         # active -- an L1 policy other than ultraep must see this attribute
         # exist (as None) rather than raise AttributeError.
-        # (layer_id, transfer_metadata, new_indices, comm_stream_event)
-        self._ultraep_pending_transfer: tuple[int, Any, Any, Any] | None = None
-        self._ultraep_pending_transfer_issued_at: float | None = None
         self._ultraep_min_representative_tokens = int(
             os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "8")
         )
@@ -469,24 +465,9 @@ class MlbRoutingRuntime:
         self._ultraep_expert_buffer = expert_buffer
         self._ultraep_communicator = communicator
         self._ultraep_num_local_physical = self.num_physical_experts // self.ep_size
-        # Only ever used by overlap mode, but allocated unconditionally: a CUDA
-        # stream is cheap, and creating one lazily inside the refresh would put
-        # the allocation on the first refresh's critical path.
-        self._ultraep_comm_stream = torch.cuda.Stream()
 
         interval = int(os.environ.get("MLB_ULTRAEP_REFRESH_INTERVAL", "64"))
         self._ultraep_refresh_gate = RefreshGate(interval)
-        # Experimental overlap mode (MLB_ULTRAEP_OVERLAP_TRANSFER=1): at most
-        # one issued-but-not-finished transfer at a time is a safe assumption
-        # because MoE layers execute sequentially within one forward pass --
-        # issue happens in this layer's own routing resolution, immediately
-        # before this layer's own _forward_impl runs, and
-        # finish_pending_ultraep_transfer() is called from inside that same
-        # forward_impl, before the next layer's routing resolution can issue a
-        # new one. Breaks under concurrent/overlapped multi-batch scheduling
-        # (DBO and similar), which this experiment does not cover. (Attribute
-        # itself is declared in __init__, not here, so it exists as None even
-        # when ultraep is not the active policy -- see that declaration.)
         logger.info(
             "UltraEP fast refresh enabled (interval=%d representative "
             "batches, min_tokens=%d, num_layers=%d, "
@@ -1038,10 +1019,9 @@ class MlbRoutingRuntime:
         Both arrays are logical-expert ids per physical slot, EP-wide -- exactly
         the pair ``EplbState`` hands its own periodic rearrangement, so this is
         that same P2P move driven at this policy's cadence instead of at the
-        rearrangement interval. ``move_to_buffer`` is the half that talks to
-        other ranks; ``move_from_buffer`` is the local copy that lands the
-        result. Keeping them separate is what lets the remote half overlap real
-        work (see the overlap branch below).
+        rearrangement interval. ``move_to_buffer`` talks to the other ranks and
+        ``move_from_buffer`` lands the result locally; both run here, in order,
+        on the calling stream.
         """
         if (old_np == new_np).all():
             # The solve landed on the placement already in memory. Nothing to
@@ -1050,82 +1030,22 @@ class MlbRoutingRuntime:
             # this the same way.
             return
 
-        from vllm.distributed.eplb.rebalance_execute import move_to_buffer
+        from vllm.distributed.eplb.rebalance_execute import (
+            move_from_buffer,
+            move_to_buffer,
+        )
 
-        overlap = os.environ.get("MLB_ULTRAEP_OVERLAP_TRANSFER", "0") == "1"
-        # Overlap mode runs the remote half on its own stream so it proceeds
-        # while the caller goes on to route and dispatch this same layer --
-        # UltraEP's own pipeline puts weight distribution on a comm stream
-        # beside the reroute for exactly this reason, and vLLM's own async
-        # rearrangement worker overlaps the identical primitives the identical
-        # way (a dedicated stream handed to the communicator via set_stream).
-        # It is only ever an overlap: the landing half still waits on the event
-        # recorded here, so the FFN never reads a half-moved expert.
-        #
-        # Ordering: the comm stream must not start overwriting the staging
-        # buffer until the previous landing half -- enqueued on the compute
-        # stream -- has finished reading it. wait_stream establishes that edge.
-        stream = self._ultraep_comm_stream if overlap else None
-        if stream is not None:
-            stream.wait_stream(torch.cuda.current_stream())
-        self._ultraep_communicator.set_stream(stream)
-        try:
-            with torch.cuda.stream(stream):
-                metadata = move_to_buffer(
-                    num_local_experts=self._ultraep_num_local_physical,
-                    old_indices=old_np,
-                    new_indices=new_np,
-                    expert_weights=self._ultraep_expert_weights[layer_id],
-                    expert_weights_buffers=self._ultraep_expert_buffer,
-                    cuda_stream=stream,
-                    ep_rank=self.ep_rank,
-                    communicator=self._ultraep_communicator,
-                    layer_idx=layer_id,
-                )
-        finally:
-            # Left as this runtime found it: the communicator is EplbState's,
-            # shared with its own periodic rearrangement.
-            self._ultraep_communicator.set_stream(None)
-
-        done = None
-        if stream is not None:
-            done = torch.cuda.Event()
-            done.record(stream)
-
-        pending = (layer_id, metadata, new_np, done)
-        if overlap:
-            stale = self._ultraep_pending_transfer
-            if stale is not None:
-                # One slot is enough only while MoE layers run strictly in
-                # sequence and every issue is followed by its own finish (see
-                # _init_ultraep_fast_refresh). If that ever stops holding, the
-                # staging buffer this issue is about to reuse still holds the
-                # previous layer's data: land it rather than drop it, and say
-                # so, instead of silently leaving that layer's weight unmoved.
-                logger.warning_once(
-                    "ultraep overlap: layer %d issued a transfer while layer "
-                    "%d's was still pending -- landing the older one first. "
-                    "The one-pending-transfer assumption does not hold under "
-                    "this scheduling.",
-                    layer_id,
-                    stale[0],
-                )
-                self._ultraep_pending_transfer = None
-                self._land_placement_weights(stale)
-            self._ultraep_pending_transfer = pending
-            if os.environ.get("MLB_ULTRAEP_OVERLAP_DEBUG_TIMING", "0") == "1":
-                self._ultraep_pending_transfer_issued_at = time.perf_counter()
-        else:
-            self._land_placement_weights(pending)
-
-    def _land_placement_weights(self, pending: tuple[int, Any, Any, Any]) -> None:
-        from vllm.distributed.eplb.rebalance_execute import move_from_buffer
-
-        layer_id, metadata, new_np, done = pending
-        if done is not None:
-            # Stream-ordered, not a host block: the compute stream queues behind
-            # the transfer rather than the CPU stalling on it.
-            torch.cuda.current_stream().wait_event(done)
+        metadata = move_to_buffer(
+            num_local_experts=self._ultraep_num_local_physical,
+            old_indices=old_np,
+            new_indices=new_np,
+            expert_weights=self._ultraep_expert_weights[layer_id],
+            expert_weights_buffers=self._ultraep_expert_buffer,
+            cuda_stream=None,
+            ep_rank=self.ep_rank,
+            communicator=self._ultraep_communicator,
+            layer_idx=layer_id,
+        )
         move_from_buffer(
             expert_weights=self._ultraep_expert_weights[layer_id],
             expert_weights_buffers=self._ultraep_expert_buffer,
@@ -1133,27 +1053,6 @@ class MlbRoutingRuntime:
             new_indices=new_np,
             ep_rank=self.ep_rank,
         )
-
-    def finish_pending_ultraep_transfer(self) -> None:
-        """Call from vLLM's own FFN forward, after real dispatch work has
-        run, before the FFN compute reads expert weights -- the other half
-        of the overlap experiment above. No-op if overlap mode issued
-        nothing this call (interval gating, non-representative batch, decode
-        stage, or overlap mode simply being off)."""
-        pending = self._ultraep_pending_transfer
-        if pending is None:
-            return
-        self._ultraep_pending_transfer = None
-        if os.environ.get("MLB_ULTRAEP_OVERLAP_DEBUG_TIMING", "0") == "1":
-            issued_at = getattr(self, "_ultraep_pending_transfer_issued_at", None)
-            if issued_at is not None:
-                gap_ms = (time.perf_counter() - issued_at) * 1000
-                logger.info(
-                    "MLB_ULTRAEP_OVERLAP_DEBUG: issue->finish wall-clock gap "
-                    "= %.3f ms",
-                    gap_ms,
-                )
-        self._land_placement_weights(pending)
 
     def replica_shares(
         self,
