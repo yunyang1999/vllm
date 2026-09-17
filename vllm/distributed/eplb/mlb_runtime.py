@@ -247,6 +247,12 @@ class MlbRoutingRuntime:
         self.requires_post_topk_routing = caps.requires_post_topk_routing
         self.requires_placement_state = caps.requires_placement_state
         self.requires_rank_dispatch_map = caps.requires_rank_dispatch_map
+        # Whether a policy in this pipeline picks the shared expert's rank.
+        # The router still has to have somewhere to put that answer -- it only
+        # asks when its layer was built with the EP shared-expert layout
+        # (VLLM_FUSE_SHARED_EXPERTS). getattr, because an older MLB has no
+        # such field.
+        self.routes_shared_expert = getattr(caps, "routes_shared_expert", False)
         # A policy whose answer depends only on the committed placement does
         # not need the per-forward call at all: bake the answer into a map the
         # fused kernel already knows how to read, and the boundary disappears.
@@ -356,6 +362,11 @@ class MlbRoutingRuntime:
         # Set by replica_shares when a policy answers with ids; read by
         # resolve_routing in the same call.
         self._last_physical_ids: torch.Tensor | None = None
+        # Same one-call handoff for a shared-expert decision. Separate from the
+        # ids because the router consumes them at different points: the ids
+        # feed the EPLB mapping kernel, the rank feeds the append that happens
+        # after it.
+        self._last_shared_expert_rank: torch.Tensor | None = None
         # Set by plan_placement() after an UltraEP L1 solve, read by
         # _snapshot() on every forward until the next solve replaces them.
         # None for every other L1 policy, and before the first solve.
@@ -835,6 +846,26 @@ class MlbRoutingRuntime:
         ids = None if shares is not None else self._last_physical_ids
         return shares, ids
 
+    def resolve_shared_expert_rank(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        layer_state: EplbLayerState,
+        num_unpadded_tokens: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """The per-token home rank for the shared expert, or None.
+
+        Reads what the pipeline just decided rather than running it again:
+        ``resolve_routing`` has already crossed the routing boundary for this
+        layer, and Waterfill's answer came back in the same decision. Calling
+        MLB twice would double the only per-layer cost this integration has.
+
+        None means "no policy answered", which the caller reads as "this
+        rank" -- the placement the replicated MLP had.
+        """
+        del topk_ids, topk_weights, layer_state, num_unpadded_tokens
+        return self._last_shared_expert_rank
+
     def _ultraep_fast_refresh(
         self,
         layer_id: int,
@@ -1140,14 +1171,20 @@ class MlbRoutingRuntime:
         ``resolve_routing`` reads after this call returns.
 
         ``routed_scaling_factor`` is plumbed but left at its default: MLB only
-        reads it when materializing a shared-expert decision, and vLLM's CUDA
-        path has no shared-expert dispatch to materialize.
+        reads it when it materializes a shared-expert decision into expanded
+        ids, which is SGLang's contract. vLLM takes back the *rank* and builds
+        the extra top-k column itself, applying 1/routed_scaling_factor as that
+        column's weight in the layer (see shared_expert_fusion.py).
         """
 
-        from moe_load_balancer.adapters.vllm import to_routing_request
+        from moe_load_balancer.adapters.vllm import (
+            to_routing_request,
+            to_vllm_shared_expert_rank,
+        )
         from moe_load_balancer.kernels.expert_count import count_logical_experts
 
         self._last_physical_ids = None
+        self._last_shared_expert_rank = None
         layer_id = layer_state.moe_layer_idx
         if layer_id is None:
             raise RuntimeError(
@@ -1177,7 +1214,13 @@ class MlbRoutingRuntime:
         # After the count write above, not before it -- the counts feed the
         # next placement and LPLB's solve, and neither stops being wanted just
         # because this placement happens to be degenerate.
-        if not self._placement_offers_replica_choice:
+        #
+        # A shared-expert policy is exempt: it decides which rank runs the
+        # shared expert, a choice that exists whether or not any logical
+        # expert has a second copy. Returning here for `waterfill` (which
+        # expands to `static+waterfill`) would drop its decision on every
+        # red0 deployment.
+        if not self._placement_offers_replica_choice and not self.routes_shared_expert:
             return None
 
         # Only policies that read the load have to wait for it. Gating every
@@ -1276,6 +1319,13 @@ class MlbRoutingRuntime:
         # Every replica policy resolves its own ids now; none answers with a
         # share table for this runtime to apply. Record the ids for
         # resolve_routing to pick up.
+        #
+        # The shared-expert rank is recorded before the `ids is topk_ids`
+        # early return below: a pipeline can decide a rank while leaving the
+        # routed ids untouched (bare `waterfill` does exactly that), and
+        # returning early there would discard the only decision it made.
+        self._last_shared_expert_rank = to_vllm_shared_expert_rank(decision)
+
         ids = decision.routed_physical_topk_ids
         if ids is None or ids is topk_ids:
             return None
@@ -1380,10 +1430,16 @@ def l2_pipeline_capabilities(algorithm: str):
 def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | None:
     """Why the named policy cannot act on this deployment, or None.
 
-    The reason is the policy's own words. vLLM replicates the shared expert
-    per rank and never dispatches it, which is what makes a shared-expert
-    policy inapplicable here whatever the redundancy -- a distinction the
-    policy draws, not one this side can assume.
+    The reason is the policy's own words. What this side supplies is whether
+    the shared expert is dispatched at all: with VLLM_FUSE_SHARED_EXPERTS off
+    it is a per-rank replicated MLP, so there is no rank for a shared-expert
+    policy to choose and the policy says so itself.
+
+    Answered from the env switch rather than from a built layer because this
+    runs during configuration validation, before any model exists. A layer
+    that then turns out not to be fusible (uneven split, EP disabled) simply
+    never asks MLB for a shared-expert rank -- the router checks its own
+    geometry before it calls.
     """
     if not algorithm:
         return None
@@ -1394,10 +1450,14 @@ def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | 
         pipeline = RoutingPipeline.from_value(algorithm)
     except Exception:
         return None
+    from vllm.model_executor.layers.fused_moe.shared_expert_fusion import (
+        shared_expert_fusion_enabled,
+    )
+
     return pipeline.is_applicable(
         ExpertDeploymentConfig(
             num_redundant_experts=num_redundant_experts,
-            routes_shared_expert=False,
+            routes_shared_expert=shared_expert_fusion_enabled(),
         )
     )
 

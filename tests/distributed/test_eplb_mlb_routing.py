@@ -350,19 +350,39 @@ def test_synthesized_default_prefers_local_replicas():
                 )
 
 
-def test_waterfill_is_rejected_rather_than_silently_dropped():
-    """vLLM's CUDA path has no shared-expert dispatch, so a shared-expert
-    decision has nowhere to be written back."""
-    from moe_load_balancer.adapters.vllm import to_vllm_topk_ids
-    from moe_load_balancer.core.types import RoutingDecision
+def test_waterfill_is_rejected_unless_the_shared_expert_is_dispatched(monkeypatch):
+    """A shared-expert decision needs somewhere to be written back, and on this
+    runtime that place exists only when shared-expert fusion is on: without it
+    the shared expert is a per-rank replicated MLP that never enters dispatch,
+    so there is no destination rank to choose.
 
-    decision = RoutingDecision(
-        routed_physical_topk_ids=torch.zeros(2, 2, dtype=torch.int64),
-        topk_weights=torch.zeros(2, 2),
-        shared_expert_rank=torch.zeros(2, dtype=torch.int64),
-    )
-    with pytest.raises(NotImplementedError, match="Shared-expert routing"):
-        to_vllm_topk_ids(decision)
+    The guard used to live in the id converter, which raised on any decision
+    carrying a shared_expert_rank. It now lives at configuration time instead,
+    which is the better place -- a pipeline that cannot work is refused before
+    the server starts rather than part-way through a forward -- but the
+    property being guarded is the same one: never accept the decision and then
+    drop it.
+    """
+    from vllm.distributed.eplb.mlb_runtime import l2_inapplicable_reason
+
+    monkeypatch.setenv("VLLM_FUSE_SHARED_EXPERTS", "0")
+    import importlib
+
+    import vllm.envs
+
+    importlib.reload(vllm.envs)
+    for expr in ("waterfill", "ultraep+waterfill"):
+        reason = l2_inapplicable_reason(expr, num_redundant_experts=16)
+        assert reason is not None, f"{expr} must be refused without fusion"
+        assert "shared expert" in reason
+
+    # ultraep alone routes nothing shared and is unaffected either way.
+    assert l2_inapplicable_reason("ultraep", num_redundant_experts=16) is None
+
+    monkeypatch.setenv("VLLM_FUSE_SHARED_EXPERTS", "1")
+    importlib.reload(vllm.envs)
+    for expr in ("waterfill", "ultraep+waterfill"):
+        assert l2_inapplicable_reason(expr, num_redundant_experts=16) is None
 
 
 def test_placement_commit_refreshes_policy_state():

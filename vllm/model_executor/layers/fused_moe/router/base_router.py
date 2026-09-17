@@ -10,6 +10,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
+from vllm.model_executor.layers.fused_moe.shared_expert_fusion import (
+    SharedExpertFusion,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -316,6 +319,11 @@ class BaseRouter(FusedMoERouter):
         self.top_k = top_k
         self.global_num_experts = global_num_experts
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        # Set by FusedMoEFactory when the layer dispatches its shared expert.
+        # None -- the default -- leaves every routing path byte-identical to
+        # what it was, which is what makes this safe to leave in the template
+        # method rather than behind a separate router subclass.
+        self.shared_expert_fusion: SharedExpertFusion | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
@@ -440,7 +448,50 @@ class BaseRouter(FusedMoERouter):
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids, topk_weights)
 
+        # Step 3.5: Give the shared expert a home rank and a top-k column.
+        #
+        # After the EPLB mapping, not before: the shared slot is already
+        # physical and has no logical identity to map, and EPLB's expert-load
+        # accounting covers routed experts only -- recording a shared-slot id
+        # in it would attribute traffic to a logical expert that does not
+        # exist.
+        if self.shared_expert_fusion is not None:
+            topk_ids, topk_weights = self._append_shared_expert(topk_ids, topk_weights)
+
         # Step 4: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, topk_indices_dtype)
 
         return topk_weights, topk_ids
+
+    def _append_shared_expert(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Re-map routed ids into the widened space and append the shared slot.
+
+        The home rank comes from an L2 policy when one routes the shared
+        expert (MLB's Waterfill), and is this rank otherwise. Falling back to
+        this rank rather than refusing to run keeps the fusion testable on its
+        own: it places the shared expert exactly where the replicated MLP did,
+        so any output difference is the dispatch detour and not a routing
+        decision.
+        """
+        fusion = self.shared_expert_fusion
+        assert fusion is not None
+
+        shared_rank = None
+        eplb_state = self.eplb_state
+        if eplb_state is not None and eplb_state.num_unpadded_tokens_tensors is not None:
+            from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+
+            routing = get_mlb_routing()
+            if routing is not None and routing.routes_shared_expert:
+                shared_rank = routing.resolve_shared_expert_rank(
+                    topk_ids,
+                    topk_weights,
+                    eplb_state,
+                    eplb_state.num_unpadded_tokens_tensors[dbo_current_ubatch_id()],
+                )
+
+        return fusion.append_shared_expert(topk_ids, topk_weights, shared_rank)

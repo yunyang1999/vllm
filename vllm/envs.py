@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_FUSE_SHARED_EXPERTS: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1554,6 +1555,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
     # treats topk_id == -1 as a skip sentinel
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # Dispatch the shared expert(s) through the EP all-to-all instead of
+    # running a replicated MLP on every rank.
+    #
+    # Each EP rank gets its own expert slot for the shared expert, appended
+    # after that rank's routed slots, so a shared-expert token has exactly one
+    # owning rank -- the invariant DeepEP's `expert_id // experts_per_rank`
+    # rank derivation relies on. This is what gives a load balancer something
+    # to decide (MLB's Waterfill L2 picks that rank); with the shared expert
+    # replicated per rank there is no choice to make.
+    #
+    # Distinct from VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS, which fuses the
+    # shared expert into the *local* grouped GEMM under one globally shared
+    # expert id and de-duplicates with a token-level mask -- a layout DeepEP
+    # cannot route.
+    "VLLM_FUSE_SHARED_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_FUSE_SHARED_EXPERTS", "0"))
+    ),
     # Kimi-K3 only. Under sequence-parallel MoE the dense and shared-expert MLPs
     # are replicated on every rank, so each rank streams the whole weight to
     # serve its own token shard. Shard them across TP instead: the MLP then
