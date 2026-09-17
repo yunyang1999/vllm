@@ -268,6 +268,23 @@ def FusedMoEFactory(
         ),
         layer_name=layer_name,
     )
+    # The fused shared expert carries a constant weight (1/routed_scaling_factor
+    # above), which is only the right magnitude when the routed weights sum to
+    # one -- i.e. when the router renormalizes. Without that, the unfused path
+    # would have scaled the shared expert by sum(routed weights) and this one
+    # does not, so the two stop agreeing and the error shows up as a quality
+    # regression rather than a failure. SGLang's integration carries the same
+    # implicit assumption; making it explicit is cheap.
+    if shared_expert_fusion is not None and not renormalize:
+        raise ValueError(
+            "Shared-expert fusion assumes a renormalizing router: the fused "
+            "shared expert is given a constant weight, which is only correct "
+            "when the routed weights sum to 1. This model routes with "
+            "renormalize=False. Unset VLLM_FUSE_SHARED_EXPERTS (and drop "
+            "waterfill from VLLM_MLB_L2_ALGORITHM, which turns fusion on) to "
+            "keep the shared expert replicated per rank."
+        )
+
     if shared_expert_fusion is not None and num_fused_shared_experts > 0:
         raise ValueError(
             "VLLM_FUSE_SHARED_EXPERTS and the AITER fused-shared-expert path "

@@ -180,7 +180,7 @@ def maybe_build_shared_expert_fusion(
     MLP. The one case worth a log is an uneven split, because that one looks
     like it should have worked.
     """
-    if not envs.VLLM_FUSE_SHARED_EXPERTS:
+    if not shared_expert_fusion_enabled():
         return None
     if not n_shared_experts:
         return None
@@ -196,7 +196,7 @@ def maybe_build_shared_expert_fusion(
         if not warn_on_uneven:
             return None
         logger.warning(
-            "VLLM_FUSE_SHARED_EXPERTS is set but %s has %d physical experts "
+            "Shared-expert fusion is on but %s has %d physical experts "
             "over %d EP ranks, which does not divide evenly. Falling back to "
             "the replicated shared-expert MLP.",
             layer_name or "this MoE layer",
@@ -214,11 +214,49 @@ def maybe_build_shared_expert_fusion(
     )
 
 
+def _l2_pipeline_needs_dispatched_shared_expert() -> bool:
+    """Whether the configured MLB L2 pipeline picks the shared expert's rank."""
+    from vllm.distributed.eplb.mlb_runtime import mlb_l2_algorithm
+
+    algorithm = mlb_l2_algorithm()
+    if not algorithm:
+        return False
+    try:
+        from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+
+        caps = RoutingPipeline.from_value(algorithm).capabilities
+    except Exception:
+        return False
+    return bool(getattr(caps, "routes_shared_expert", False))
+
+
 def shared_expert_fusion_enabled() -> bool:
-    """Whether the env switch is on, for call sites that decide before a layer exists.
+    """Whether the shared expert is dispatched rather than replicated per rank.
+
+    The env switch turns it on, and so does asking for an L2 pipeline that
+    routes the shared expert: waterfill picks a rank for it, and there is no
+    rank to pick unless it goes through dispatch. Selecting that pipeline and
+    leaving the switch off used to leave MLB's L2 quietly disabled -- the
+    configuration was refused, a line went by in the log, and the run carried
+    on doing none of what was asked for. Turning it on and saying so is how
+    SGLang resolves the same pair (`enable_deepep_waterfill` forces shared
+    expert fusion there and warns), and a loud change of configuration beats a
+    silent cancellation of one.
 
     Says nothing about whether any particular layer *can* fuse -- that is
     ``maybe_build_shared_expert_fusion``'s answer, and it needs a layer's
     geometry to give it.
     """
-    return bool(envs.VLLM_FUSE_SHARED_EXPERTS)
+    if envs.VLLM_FUSE_SHARED_EXPERTS:
+        return True
+    if _l2_pipeline_needs_dispatched_shared_expert():
+        logger.warning_once(
+            "Enabling shared-expert fusion: the configured MLB L2 pipeline "
+            "(VLLM_MLB_L2_ALGORITHM) assigns the shared expert to a rank, "
+            "which requires it to go through expert-parallel dispatch. Set "
+            "VLLM_FUSE_SHARED_EXPERTS=1 to make this explicit, or drop "
+            "waterfill from the pipeline to keep the shared expert "
+            "replicated per rank."
+        )
+        return True
+    return False
