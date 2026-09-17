@@ -260,6 +260,24 @@ class MlbRoutingRuntime:
         self.dispatch_fixed_by_placement = getattr(
             caps, "dispatch_fixed_by_placement", False
         )
+        # These two cannot both hold. Routing a shared expert means choosing a
+        # rank per batch from that batch's load; "fixed by placement" means the
+        # answer is a function of the committed placement alone and the
+        # per-forward call can be skipped. A pipeline claiming both gets its
+        # shared-expert decisions computed and then thrown away, and the stale
+        # ones from the previous layer read in their place -- with no symptom
+        # beyond a quality regression. Checked here rather than trusted: the
+        # default above protects against an MLB too old to have the field, but
+        # not against one old enough to have it and set it wrong.
+        if self.routes_shared_expert and self.dispatch_fixed_by_placement:
+            raise ValueError(
+                f"MLB routing pipeline {algorithm!r} reports both "
+                "routes_shared_expert and dispatch_fixed_by_placement. A "
+                "shared-expert rank is a per-batch decision, so it cannot be "
+                "baked in at placement-commit time; one of the two is wrong. "
+                "An MLB predating the fix to dispatch_fixed_by_placement "
+                "reports this for any pipeline containing waterfill."
+            )
         # Declared by the pipeline rather than inferred from "has a post-TopK
         # policy": a replica policy can route from placement alone, and
         # gathering the EP-wide load for it costs a collective per step that is

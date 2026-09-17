@@ -125,12 +125,34 @@ class SharedExpertFusion:
         offsets = torch.arange(
             self.num_shared_experts, dtype=ids.dtype, device=ids.device
         )
-        shared_ids = home * self.slots_per_rank + self.routed_slots_per_rank + offsets
-        shared_weights = torch.full(
-            (num_tokens, self.num_shared_experts),
-            self.shared_expert_weight,
-            dtype=topk_weights.dtype,
-            device=topk_weights.device,
+        # A policy answers -1 for a token it will not place -- a padded row, or
+        # one whose routed ids are all invalid. Arithmetic on that lands
+        # somewhere real: -1 * slots + routed + 0 is -1 only because the two
+        # terms happen to cancel at num_shared_experts == 1, and at 2 it yields
+        # -2, which torch reads as an index from the end rather than as "no
+        # expert". Carry the sentinel through explicitly instead of relying on
+        # that, and zero the weight so a row that reaches a kernel anyway
+        # contributes nothing. remap_routed_ids above guards the routed columns
+        # the same way; this is the matching guard for the shared one.
+        placed = home >= 0
+        shared_ids = torch.where(
+            placed,
+            home * self.slots_per_rank + self.routed_slots_per_rank + offsets,
+            torch.full_like(home, -1),
+        )
+        shared_weights = torch.where(
+            placed,
+            torch.full(
+                (num_tokens, self.num_shared_experts),
+                self.shared_expert_weight,
+                dtype=topk_weights.dtype,
+                device=topk_weights.device,
+            ),
+            torch.zeros(
+                (num_tokens, self.num_shared_experts),
+                dtype=topk_weights.dtype,
+                device=topk_weights.device,
+            ),
         )
         return (
             torch.cat((ids, shared_ids), dim=-1),
