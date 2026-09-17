@@ -566,6 +566,13 @@ class EplbState:
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
                 expert_weights=model.expert_weights,
+                # The same staging buffer and P2P communicator this state uses
+                # for its own periodic rearrangement. A policy that re-plans
+                # placement mid-run has to move weight to match it, and that is
+                # this file's machinery, not something a policy brings its own
+                # copy of -- see MlbRoutingRuntime._commit_placement_weights.
+                expert_buffer=expert_buffer,
+                communicator=communicator,
                 # A step interval that the run can actually reach means the
                 # placement will be re-planned, which is the case a captured
                 # graph cannot follow when the policy keeps solver state.
