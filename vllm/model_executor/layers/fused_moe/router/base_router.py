@@ -482,7 +482,10 @@ class BaseRouter(FusedMoERouter):
 
         shared_rank = None
         eplb_state = self.eplb_state
-        if eplb_state is not None and eplb_state.num_unpadded_tokens_tensors is not None:
+        if (
+            eplb_state is not None
+            and eplb_state.num_unpadded_tokens_tensors is not None
+        ):
             from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
 
             routing = get_mlb_routing()

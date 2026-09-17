@@ -189,7 +189,9 @@ def test_current_stage_under_dp_ignores_this_ranks_own_decode_shape(monkeypatch)
         uniform_decode_across_dp = False
         dp_metadata = object()
 
-    monkeypatch.setattr(mlb_runtime, "is_forward_context_available", lambda: True, raising=False)
+    monkeypatch.setattr(
+        mlb_runtime, "is_forward_context_available", lambda: True, raising=False
+    )
     monkeypatch.setattr(
         "vllm.forward_context.is_forward_context_available", lambda: True
     )
@@ -214,7 +216,7 @@ def test_dp_token_counts_reads_the_tensor_that_actually_exists():
     disagreement it exists to prevent, while looking like a working fix. The
     assertion that matters here is simply that it is not None."""
     from vllm.distributed.eplb.mlb_runtime import _dp_token_counts
-    from vllm.forward_context import DPMetadata, ForwardContext
+    from vllm.forward_context import DPMetadata
 
     counts = torch.tensor([4096, 0, 0, 0], dtype=torch.int32)
 

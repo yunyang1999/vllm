@@ -1185,7 +1185,9 @@ class RoutedExperts(PluggableLayer):
         # asserts it tiles the physical expert count, which counts routed
         # experts only. The slice is a view of the same storage, so a
         # rearrangement still writes through to the real parameter.
-        num_routed_local = self.local_num_experts - self.moe_config.num_local_shared_experts
+        num_routed_local = (
+            self.local_num_experts - self.moe_config.num_local_shared_experts
+        )
         return [
             weight.view(self.local_num_experts, -1)[:num_routed_local]
             for name, weight in weights
