@@ -441,8 +441,15 @@ class MlbRoutingRuntime:
         # forward for every MoE layer regardless of which L1 policy is
         # active -- an L1 policy other than ultraep must see this attribute
         # exist (as None) rather than raise AttributeError.
+        # 512 is the reference inference integration's default (SGLang's
+        # `moe_balance_refresh_min_tokens`). The solve reads only the batch in
+        # front of it and the answer is then held for a whole refresh interval,
+        # so re-solving on a batch too small to be representative fits the
+        # placement to noise and keeps it there. It bites only where batches
+        # are genuinely small: a prefill-shaped step is orders of magnitude
+        # above either threshold.
         self._ultraep_min_representative_tokens = int(
-            os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "8")
+            os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "512")
         )
         # Parsed, not compared as a string. `algorithm` is the whole L2
         # expression, so an equality test here silently misses every
