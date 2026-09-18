@@ -1470,6 +1470,18 @@ def plan_placement(request):
             plan.logical_to_all_physical_map
         )
         integration.routing._ultraep_replica_counts = plan.logical_to_physical_count
+        # All three come from the same plan whose physical_to_logical_map the
+        # caller commits next, so every layer's tables are consistent with the
+        # placement as of this moment. Say so: `_snapshot` routes a layer
+        # against MLB's tables only once it appears here, and leaving the set
+        # empty left this solve's routing unused until something else added the
+        # layer. Nothing was observably wrong -- RefreshGate refreshes on a
+        # layer's first call whatever the interval, so every layer was added on
+        # its first forward -- but the invariant was being maintained by a
+        # second component's incidental behaviour rather than by the code that
+        # knows the tables are ready. Stating it here is what makes the gate's
+        # meaning ("routable") match the condition it tests.
+        integration.routing._ultraep_committed_layers = set(range(quota.shape[0]))
     return to_vllm_physical_to_logical(plan), plan
 
 
