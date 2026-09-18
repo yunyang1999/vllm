@@ -83,9 +83,7 @@ def test_every_replica_policy_resolves_ids_rather_than_going_silent():
     state = _layer_state(rt)
     torch.manual_seed(0)
     logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
-    shares, ids = rt.resolve_routing(
-        logical, torch.rand(NUM_TOKENS, TOPK), state, None
-    )
+    shares, ids = rt.resolve_routing(logical, torch.rand(NUM_TOKENS, TOPK), state, None)
     # Every replica policy resolves its own ids now; none hands back a share
     # table for this method to apply.
     assert shares is None
@@ -127,9 +125,7 @@ def test_ultraep_fast_refresh_degrades_gracefully_without_a_mover():
     state = _layer_state(rt)
     torch.manual_seed(0)
     logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
-    shares, ids = rt.resolve_routing(
-        logical, torch.rand(NUM_TOKENS, TOPK), state, None
-    )
+    shares, ids = rt.resolve_routing(logical, torch.rand(NUM_TOKENS, TOPK), state, None)
     assert shares is None
     assert ids is not None and ids.shape == logical.shape
 
@@ -303,9 +299,7 @@ def test_snapshot_ignores_uncommitted_ultraep_tables():
     rt._ultraep_logical_to_physical = torch.zeros(
         NUM_LAYERS, NUM_LOGICAL, EP_SIZE, dtype=torch.int64
     )
-    rt._ultraep_replica_counts = torch.ones(
-        NUM_LAYERS, NUM_LOGICAL, dtype=torch.int64
-    )
+    rt._ultraep_replica_counts = torch.ones(NUM_LAYERS, NUM_LOGICAL, dtype=torch.int64)
     assert rt._ultraep_committed_layers == set()
 
     snap = rt._snapshot(state, 0)
@@ -412,9 +406,7 @@ def test_placement_commit_refreshes_policy_state():
     assert torch.equal(
         snapshot.logical_to_physical_candidates, rt._logical_to_physical_map[0]
     )
-    shares, ids = rt.resolve_routing(
-        logical, torch.rand(NUM_TOKENS, TOPK), state, None
-    )
+    shares, ids = rt.resolve_routing(logical, torch.rand(NUM_TOKENS, TOPK), state, None)
     assert (shares is None) != (ids is None)
 
 
@@ -451,9 +443,7 @@ def test_replica_routing_sees_every_replica_not_just_the_local_one():
     assert torch.equal(
         snapshot.logical_to_physical_candidates, rt._logical_to_physical_map[0]
     ), "LPLB was handed a narrowed candidate list"
-    assert torch.equal(
-        snapshot.logical_to_physical_count, rt._logical_replica_count[0]
-    )
+    assert torch.equal(snapshot.logical_to_physical_count, rt._logical_replica_count[0])
     # The first 8 logical experts are replicated by _placement(); the choice
     # between their copies is exactly what the policy has to solve.
     assert int(snapshot.logical_to_physical_count[0]) == 2
@@ -782,7 +772,7 @@ def test_the_nearest_replica_table_is_refreshed_on_every_commit():
         rt = _runtime(algorithm)
         assert rt.requires_placement_state is keeps_state
         calls = []
-        rt._rebuild_default_replicas = lambda: calls.append(1)
+        rt._rebuild_default_replicas = lambda c=calls: c.append(1)
         rt._commit_layers = lambda ids: None
         rt.on_placement_committed([0])
         assert calls, (

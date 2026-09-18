@@ -192,9 +192,9 @@ class MlbRoutingRuntime:
         num_physical_experts: int,
         physical_to_logical_map: torch.Tensor,
         balancer: object | None = None,
-        expert_weights: "Any | None" = None,
-        expert_buffer: "Any | None" = None,
-        communicator: "Any | None" = None,
+        expert_weights: Any | None = None,
+        expert_buffer: Any | None = None,
+        communicator: Any | None = None,
     ) -> None:
         from moe_load_balancer import MoELoadBalancer
 
@@ -223,6 +223,7 @@ class MlbRoutingRuntime:
         # Passed to every PlacementSnapshot so LPLB can incorporate cross-GPU
         # transfer cost; SGLang always provides this, we build it from topology.
         from moe_load_balancer.adapters.vllm import build_physical_to_rank_map
+
         self._physical_to_rank_map = build_physical_to_rank_map(
             num_physical_experts,
             ep_size,
@@ -231,12 +232,16 @@ class MlbRoutingRuntime:
         # Injected when an engine-scoped integration owns the balancer, so L1
         # and L2 are served by one instance rather than two that cannot see
         # each other.
-        self._mlb = balancer if balancer is not None else MoELoadBalancer.from_algorithm(
-            algorithm,
-            ep_size=ep_size,
-            source_rank=ep_rank,
-            experts_per_rank=num_physical_experts // ep_size,
-            collectives=VllmRoutingCollectives(),
+        self._mlb = (
+            balancer
+            if balancer is not None
+            else MoELoadBalancer.from_algorithm(
+                algorithm,
+                ep_size=ep_size,
+                source_rank=ep_rank,
+                experts_per_rank=num_physical_experts // ep_size,
+                collectives=VllmRoutingCollectives(),
+            )
         )
         # MLB declares what the framework has to prepare for the selected
         # policy, so none of the work below is done unconditionally: `lplb`
@@ -516,6 +521,7 @@ class MlbRoutingRuntime:
         if torch.cuda.is_current_stream_capturing():
             return
         from vllm.distributed import get_ep_group
+
         ep_group = get_ep_group()
         ep_group.all_reduce(self._logical_count_local)
         self._logical_count_global.copy_(self._logical_count_local)
@@ -592,9 +598,7 @@ class MlbRoutingRuntime:
                 candidates,
                 counts,
                 ep_rank=self.ep_rank,
-                num_local_physical_experts=(
-                    self.num_physical_experts // self.ep_size
-                ),
+                num_local_physical_experts=(self.num_physical_experts // self.ep_size),
             )
 
         defaults = self._default_replicas
@@ -970,6 +974,7 @@ class MlbRoutingRuntime:
 
         from moe_load_balancer.adapters.vllm import to_placement_request
         from moe_load_balancer.kernels.expert_count import count_logical_experts
+
         from vllm.distributed import get_ep_group
 
         ep_group = get_ep_group().device_group
@@ -1189,7 +1194,8 @@ class MlbRoutingRuntime:
                 logger.info(
                     "MLB L2 solve cost: n=%d  median=%.0f us  p90=%.0f us  "
                     "mean=%.0f us",
-                    len(self._l2_us), statistics.median(self._l2_us),
+                    len(self._l2_us),
+                    statistics.median(self._l2_us),
                     sorted(self._l2_us)[int(0.9 * len(self._l2_us))],
                     statistics.mean(self._l2_us),
                 )
@@ -1222,9 +1228,7 @@ class MlbRoutingRuntime:
                         None if global_count is None else global_count.float().cpu()
                     ),
                     "probability": (
-                        None
-                        if lp_probability is None
-                        else lp_probability.float().cpu()
+                        None if lp_probability is None else lp_probability.float().cpu()
                     ),
                 },
                 _os.path.join(
@@ -1248,7 +1252,6 @@ class MlbRoutingRuntime:
             return None
         self._last_physical_ids = ids
         return None
-
 
 
 class VllmMlbIntegration:
@@ -1405,7 +1408,9 @@ def plan_placement(request):
     quota = plan.metadata.get("rank_quota_prefix")
     if quota is not None and integration.routing is not None:
         integration.routing._ultraep_rank_quota_prefix = quota
-        integration.routing._ultraep_logical_to_physical = plan.logical_to_all_physical_map
+        integration.routing._ultraep_logical_to_physical = (
+            plan.logical_to_all_physical_map
+        )
         integration.routing._ultraep_replica_counts = plan.logical_to_physical_count
     return to_vllm_physical_to_logical(plan), plan
 
@@ -1415,6 +1420,7 @@ def placement_request(*args, **kwargs):
     from moe_load_balancer.adapters.vllm import to_placement_request
 
     return to_placement_request(*args, **kwargs)
+
 
 def _reject_graphs_with_rearranging_placement_state(rearranges: bool) -> None:
     """Refuse the one combination that can fault the GPU.
