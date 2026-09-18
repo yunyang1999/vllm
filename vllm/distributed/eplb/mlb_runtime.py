@@ -404,6 +404,12 @@ class MlbRoutingRuntime:
         self._ultraep_logical_to_physical: torch.Tensor | None = None
         self._ultraep_replica_counts: torch.Tensor | None = None
         self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
+        # MLB_TIME_REFRESH=<n> times n fast refreshes -- the placement solve and
+        # the weight commit separately -- with a device sync on each, then
+        # reports and disarms. Same shape as MLB_TIME_L2 above.
+        self._time_refresh = int(os.environ.get("MLB_TIME_REFRESH", "0"))
+        self._solve_us: list[float] = []
+        self._commit_us: list[float] = []
         self._l2_us: list[float] = []
 
         # Real, traffic-driven placement refresh with real weight transfer,
@@ -995,7 +1001,13 @@ class MlbRoutingRuntime:
             algorithm="ultraep",
             ep_rank=self.ep_rank,
         )
+        if self._time_refresh:
+            torch.cuda.synchronize()
+            _ts = time.perf_counter()
         plan = self._mlb.plan_placement(request)
+        if self._time_refresh:
+            torch.cuda.synchronize()
+            self._solve_us.append((time.perf_counter() - _ts) * 1e6)
 
         # The request carried one synthetic layer (dim 0 of per_rank_count),
         # so the plan's own layer index is always 0 regardless of layer_id --
@@ -1026,9 +1038,48 @@ class MlbRoutingRuntime:
         # for _snapshot to route through them.
         self._ultraep_committed_layers.add(layer_id)
 
+        if self._time_refresh:
+            torch.cuda.synchronize()
+            _tc = time.perf_counter()
         self._commit_placement_weights(
             layer_id, placement_change[0], placement_change[1]
         )
+        if self._time_refresh:
+            torch.cuda.synchronize()
+            _dt = (time.perf_counter() - _tc) * 1e6
+            # How much this commit actually had to move: slots whose occupant
+            # changed. A refresh that re-solves to the same placement moves
+            # nothing, and the first commit for a layer moves everything, so
+            # the duration alone says very little without this.
+            _moved = int((placement_change[0] != placement_change[1]).sum())
+            self._commit_us.append((_moved, _dt))
+            if len(self._commit_us) >= self._time_refresh:
+                import statistics
+
+                def _q(v, f):
+                    return sorted(v)[min(int(f * len(v)), len(v) - 1)] if v else 0.0
+
+                idle = [d for m, d in self._commit_us if m == 0]
+                moving = [(m, d) for m, d in self._commit_us if m > 0]
+                logger.info(
+                    "MLB refresh cost over %d refreshes: solve median=%.0f us "
+                    "p90=%.0f us | commits that moved nothing: n=%d median=%.0f us "
+                    "| commits that moved slots: n=%d median slots=%.0f "
+                    "median=%.0f us p90=%.0f us max=%.0f us",
+                    len(self._commit_us),
+                    statistics.median(self._solve_us),
+                    _q(self._solve_us, 0.9),
+                    len(idle),
+                    statistics.median(idle) if idle else 0.0,
+                    len(moving),
+                    statistics.median([m for m, _ in moving]) if moving else 0.0,
+                    statistics.median([d for _, d in moving]) if moving else 0.0,
+                    _q([d for _, d in moving], 0.9),
+                    max([d for _, d in moving], default=0.0),
+                )
+                self._solve_us.clear()
+                self._commit_us.clear()
+                self._time_refresh = 0
 
     def _commit_placement_weights(
         self,
