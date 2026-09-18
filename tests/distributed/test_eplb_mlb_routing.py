@@ -381,6 +381,31 @@ def test_waterfill_is_rejected_unless_the_shared_expert_is_dispatched(monkeypatc
         assert l2_inapplicable_reason(expr, num_redundant_experts=16) is None
 
 
+def test_l2_applicability_is_decided_on_the_config_the_run_uses(monkeypatch):
+    """Only ParallelConfig may disable L2, because only it is certainly used.
+
+    EPLBConfig defaults l2_algorithm from the environment, so the instance
+    EngineArgs builds from the field default carries an algorithm while its
+    redundancy is still zero. Deciding applicability there announced a disable
+    that never applied to the run -- once per engine core, in the same log that
+    the workers were filling with "L2 routing enabled". The decision belongs on
+    the object that ends up in the running config.
+    """
+    from vllm.config.parallel import EPLBConfig, ParallelConfig
+
+    monkeypatch.setenv("VLLM_MLB_L2_ALGORITHM", "ultraep")
+
+    # The default instance takes the algorithm from the environment and leaves
+    # it alone: its zero redundancy is a default, not a deployment.
+    assert EPLBConfig().l2_algorithm == "ultraep"
+
+    # The assembled config decides. Redundancy stays zero here, so ultraep --
+    # which only has replicas to choose between when there are redundant
+    # experts -- is switched off.
+    assembled = ParallelConfig(eplb_config=EPLBConfig(l2_algorithm="ultraep"))
+    assert assembled.eplb_config.l2_algorithm == ""
+
+
 def test_placement_commit_refreshes_policy_state():
     """A committed rearrangement must be observable without re-registration:
     vLLM updates its maps in place, and the runtime holds those tensors."""
@@ -779,3 +804,80 @@ def test_the_nearest_replica_table_is_refreshed_on_every_commit():
             f"{algorithm}: the nearest-replica table was not refreshed, so it "
             "still describes the placement before this commit"
         )
+
+
+def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
+    """A committed placement's own tables must be usable by the very next forward.
+
+    `_snapshot` hands the router MLB's candidate table, replica counts and quota
+    only for layers in `_ultraep_committed_layers`. That set used to be filled in
+    one place -- inside `_ultraep_fast_refresh` -- while the commit path filled
+    the three tables for *every* layer and marked none of them. The router
+    therefore ignored the solve it had just been handed and fell back to vLLM's
+    own candidates until a fast refresh rewrote each layer individually, which at
+    interval=64 is most of a run: measured balance sat at the no-balancer
+    baseline for the first ~50 sampling windows of those cells.
+
+    The tables come from the same plan whose physical_to_logical_map the caller
+    commits, so they are consistent for every layer at that moment; there is
+    nothing to wait for.
+    """
+    from vllm.distributed.eplb import mlb_runtime
+
+    num_layers, num_logical, max_replicas = 4, NUM_LOGICAL, 3
+
+    class _Plan:
+        physical_to_logical_map = torch.zeros(
+            (num_layers, NUM_PHYSICAL), dtype=torch.int32
+        )
+        logical_to_all_physical_map = torch.zeros(
+            (num_layers, num_logical, max_replicas), dtype=torch.int32
+        )
+        logical_to_physical_count = torch.ones(
+            (num_layers, num_logical), dtype=torch.int32
+        )
+        metadata = {
+            "rank_quota_prefix": torch.ones(
+                (num_layers, num_logical, max_replicas), dtype=torch.int32
+            )
+        }
+
+    class _Routing:
+        _ultraep_rank_quota_prefix = None
+        _ultraep_logical_to_physical = None
+        _ultraep_replica_counts = None
+        _ultraep_committed_layers: set[int] = set()
+
+    class _Balancer:
+        def plan_placement(self, request):
+            return _Plan()
+
+    routing = _Routing()
+
+    class _Integration:
+        def __init__(self):
+            self.routing = routing
+
+        def balancer(self):
+            return _Balancer()
+
+    integration = _Integration()
+    monkeypatch.setattr(mlb_runtime, "get_mlb_integration", lambda: integration)
+    # plan_placement imports this inside the function body, so the name has to
+    # be replaced where it is looked up rather than on mlb_runtime itself.
+    monkeypatch.setattr(
+        "moe_load_balancer.adapters.vllm.to_vllm_physical_to_logical",
+        lambda plan: plan.physical_to_logical_map,
+    )
+
+    mlb_runtime.plan_placement(object())
+
+    assert routing._ultraep_rank_quota_prefix is not None, (
+        "the commit path must stash the quota"
+    )
+    assert routing._ultraep_committed_layers == set(range(num_layers)), (
+        "every layer the commit path wrote tables for must be marked usable; "
+        "leaving the set empty makes the router discard this solve until a fast "
+        "refresh rewrites each layer, and how long that takes scales with the "
+        "refresh interval"
+    )

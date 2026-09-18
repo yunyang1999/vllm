@@ -143,43 +143,6 @@ class EPLBConfig:
         if not self.l2_algorithm:
             self.l2_algorithm = os.environ.get("VLLM_MLB_L2_ALGORITHM", "").strip()
 
-        # An L2 policy chooses among a logical expert's replicas. With no
-        # redundant experts there is exactly one replica each, so there is
-        # nothing to choose: the policy can only reproduce the mapping vLLM
-        # would have used anyway. Leaving it on is not merely useless -- the
-        # routing boundary is crossed per layer per forward, and a policy that
-        # consumes the EP-wide expert load pays a collective to produce a count
-        # it then discards.
-        #
-        # Turning it off here rather than making it cheap deeper down is what
-        # keeps it honest: the decision is visible, made once, and taken before
-        # anything sizes buffers or declares capabilities against it. Output is
-        # unaffected, which is what makes doing it silently unacceptable but
-        # doing it at all safe.
-        if self.l2_algorithm:
-            from vllm.distributed.eplb.mlb_runtime import l2_inapplicable_reason
-
-            reason = l2_inapplicable_reason(
-                self.l2_algorithm, self.num_redundant_experts
-            )
-            if reason is not None:
-                # Deciding here rather than deeper down means nothing
-                # downstream ever sizes a buffer, publishes a capability or
-                # picks a graph mode against a policy that was never going to
-                # act. The reason comes from the balancer: which deployments a
-                # policy can work on is a property of the policy, and a
-                # framework that decides it by assumption will switch off a
-                # policy that had work to do.
-                logger.warning(
-                    "Disabling MoE Load Balancer L2 routing (%r): %s. Routing "
-                    "is unchanged by this -- the policy could only have "
-                    "reproduced it -- but the per-layer routing boundary and "
-                    "any load collective it needed are now skipped.",
-                    self.l2_algorithm,
-                    reason,
-                )
-                self.l2_algorithm = ""
-
         return self
 
 
@@ -588,6 +551,49 @@ class ParallelConfig:
                     "enabled. Either enable EPLB or unset "
                     "num_redundant_experts."
                 )
+
+        # An L2 policy chooses among a logical expert's replicas. With no
+        # redundant experts there is exactly one replica each, so there is
+        # nothing to choose: the policy can only reproduce the mapping vLLM
+        # would have used anyway. Leaving it on is not merely useless -- the
+        # routing boundary is crossed per layer per forward, and a policy that
+        # consumes the EP-wide expert load pays a collective to produce a count
+        # it then discards.
+        #
+        # Turning it off here rather than making it cheap deeper down is what
+        # keeps it honest: the decision is visible, made once, and taken before
+        # anything sizes buffers or declares capabilities against it. Output is
+        # unaffected, which is what makes doing it silently unacceptable but
+        # doing it at all safe.
+        #
+        # It belongs on this object rather than on EPLBConfig because only this
+        # one is certain to be the config the run uses. EPLBConfig defaults
+        # l2_algorithm from the environment, so the throwaway instance that
+        # EngineArgs builds from the field default carries an algorithm while
+        # its redundancy is still zero -- deciding there announced a disable
+        # that never applied to the run, once per engine core, in exactly the
+        # log someone would read to check whether L2 was on.
+        if self.eplb_config.l2_algorithm:
+            from vllm.distributed.eplb.mlb_runtime import l2_inapplicable_reason
+
+            reason = l2_inapplicable_reason(
+                self.eplb_config.l2_algorithm,
+                self.eplb_config.num_redundant_experts,
+            )
+            if reason is not None:
+                # The reason comes from the balancer: which deployments a
+                # policy can work on is a property of the policy, and a
+                # framework that decides it by assumption will switch off a
+                # policy that had work to do.
+                logger.warning(
+                    "Disabling MoE Load Balancer L2 routing (%r): %s. Routing "
+                    "is unchanged by this -- the policy could only have "
+                    "reproduced it -- but the per-layer routing boundary and "
+                    "any load collective it needed are now skipped.",
+                    self.eplb_config.l2_algorithm,
+                    reason,
+                )
+                self.eplb_config.l2_algorithm = ""
 
         tp = self.tensor_parallel_size
         pcp = self.prefill_context_parallel_size
