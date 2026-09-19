@@ -410,6 +410,7 @@ class MlbRoutingRuntime:
         self._time_refresh = int(os.environ.get("MLB_TIME_REFRESH", "0"))
         self._solve_us: list[float] = []
         self._commit_us: list[float] = []
+        self._commit_host_us: list[float] = []
         self._l2_us: list[float] = []
 
         # Real, traffic-driven placement refresh with real weight transfer,
@@ -1052,8 +1053,10 @@ class MlbRoutingRuntime:
             layer_id, placement_change[0], placement_change[1]
         )
         if self._time_refresh:
+            _host = (time.perf_counter() - _tc) * 1e6
             torch.cuda.synchronize()
             _dt = (time.perf_counter() - _tc) * 1e6
+            self._commit_host_us.append(_host)
             # How much this commit actually had to move: slots whose occupant
             # changed. A refresh that re-solves to the same placement moves
             # nothing, and the first commit for a layer moves everything, so
@@ -1084,6 +1087,15 @@ class MlbRoutingRuntime:
                     _q([d for _, d in moving], 0.9),
                     max([d for _, d in moving], default=0.0),
                 )
+                logger.info(
+                    "MLB commit host-vs-device: host median=%.0f us | "
+                    "device-complete median=%.0f us -- if the host figure is "
+                    "well below the device one, the device is the binding "
+                    "constraint and shaving host work changes nothing",
+                    statistics.median(self._commit_host_us),
+                    statistics.median([d for _, d in self._commit_us]),
+                )
+                self._commit_host_us.clear()
                 self._solve_us.clear()
                 self._commit_us.clear()
                 self._time_refresh = 0
