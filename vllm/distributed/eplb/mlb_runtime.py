@@ -1420,10 +1420,13 @@ def l2_pipeline_capabilities(algorithm: str):
 def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | None:
     """Why the named policy cannot act on this deployment, or None.
 
-    The reason is the policy's own words. What this side supplies is whether
-    the shared expert is dispatched at all: with VLLM_FUSE_SHARED_EXPERTS off
-    it is a per-rank replicated MLP, so there is no rank for a shared-expert
-    policy to choose and the policy says so itself.
+    The reason is the policy's own words. What this side supplies is what only
+    it knows: that the L1 plan's metadata reaches the committed snapshot
+    (``to_placement_snapshot`` carries it, which is how ultraep's quota gets
+    to its router), and whether the shared expert is dispatched at all: with
+    VLLM_FUSE_SHARED_EXPERTS off it is a per-rank replicated MLP, so there is
+    no rank for a shared-expert policy to choose and the policy says so
+    itself.
 
     Answered from the env switch rather than from a built layer because this
     runs during configuration validation, before any model exists. A layer
@@ -1448,6 +1451,7 @@ def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | 
         ExpertDeploymentConfig(
             num_redundant_experts=num_redundant_experts,
             routes_shared_expert=shared_expert_fusion_enabled(),
+            carries_placement_metadata=True,
         )
     )
 
