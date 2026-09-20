@@ -222,7 +222,6 @@ class EplbModelState:
     """
 
 
-
 # Layers committed by the async worker whose policy notification is still owed.
 # Written from the worker thread, drained on the main thread; set operations are
 # atomic under the GIL and a missed drain only defers by one forward.
@@ -392,10 +391,12 @@ class EplbState:
         if init_path:
             # Saved as [num_moe_layers, num_physical_experts] -- each layer has
             # its own optimised placement.
-            p2l_full = torch.load(init_path, map_location="cpu",
-                                  weights_only=True).long()
+            p2l_full = torch.load(
+                init_path, map_location="cpu", weights_only=True
+            ).long()
             assert p2l_full.shape == (
-                model.num_moe_layers, model.num_physical_experts
+                model.num_moe_layers,
+                model.num_physical_experts,
             ), (
                 f"Placement checkpoint shape {tuple(p2l_full.shape)} does not "
                 f"match model ({model.num_moe_layers}, {model.num_physical_experts})"
@@ -434,9 +435,7 @@ class EplbState:
         )
         for i in range(model.num_physical_experts):
             logical_idx = p2l_1d[i]
-            logical_to_physical_map[
-                logical_idx, logical_replica_count[logical_idx]
-            ] = i
+            logical_to_physical_map[logical_idx, logical_replica_count[logical_idx]] = i
             logical_replica_count[logical_idx] += 1
 
         # Duplicate initial mapping for all layers
@@ -622,8 +621,7 @@ class EplbState:
             new_physical_to_logical_map=target_physical_to_logical_map,
         )
         logger.info(
-            "EPLB: rearranged experts into the checkpointed placement "
-            "(%d layers)",
+            "EPLB: rearranged experts into the checkpointed placement (%d layers)",
             target_physical_to_logical_map.shape[0],
         )
 
@@ -650,6 +648,7 @@ class EplbState:
         # the graph, one collective for all layers).  This gives LP solve a
         # stable, up-to-date input without any NCCL inside the capture stream.
         from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+
         routing = get_mlb_routing()
         if routing is not None:
             # Deliver any placement changes the async worker committed since the
@@ -1142,9 +1141,7 @@ class EplbState:
                         " (profile) " if is_profile else " ",
                         gpu_elapsed,
                     )
-                    save_path = (
-                        self.parallel_config.eplb_config.save_placement_path
-                    )
+                    save_path = self.parallel_config.eplb_config.save_placement_path
                     if save_path and not is_profile:
                         torch.save(
                             eplb_model_state.physical_to_logical_map.cpu(),

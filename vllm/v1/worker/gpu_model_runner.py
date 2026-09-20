@@ -4103,15 +4103,13 @@ class GPUModelRunner(
                 num_tokens_across_dp,
                 synced_cudagraph_mode,
                 uniform_decode_across_dp,
-            ) = (
-                coordinate_batch_across_dp(
-                    num_tokens_unpadded=num_tokens,
-                    parallel_config=self.parallel_config,
-                    allow_microbatching=allow_microbatching,
-                    num_tokens_padded=num_tokens_padded,
-                    uniform_decode=uniform_decode,
-                    cudagraph_mode=cudagraph_mode.value,
-                )
+            ) = coordinate_batch_across_dp(
+                num_tokens_unpadded=num_tokens,
+                parallel_config=self.parallel_config,
+                allow_microbatching=allow_microbatching,
+                num_tokens_padded=num_tokens_padded,
+                uniform_decode=uniform_decode,
+                cudagraph_mode=cudagraph_mode.value,
             )
 
             # Extract DP-synced values
@@ -6025,29 +6023,26 @@ class GPUModelRunner(
             num_tokens_across_dp,
             _,
             uniform_decode_across_dp,
-        ) = (
-            self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens,
-                max_num_scheduled_tokens=max_query_len,
-                use_cascade_attn=False,
-                allow_microbatching=allow_microbatching,
-                force_eager=is_profile
-                or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
-                # `force_uniform_decode` is used for cudagraph capture; because for
-                # capturing mixed prefill-decode batches, we sometimes use
-                # num_tokens == num_reqs which looks like a uniform decode batch to the
-                # dispatcher; but we actually want to capture a piecewise cudagraph
-                force_uniform_decode=uniform_decode,
-                # `force_has_lora` is used for cudagraph capture; because LoRA is
-                # activated later in the context manager, but we need to know the
-                # LoRA state when determining the batch descriptor for capture
-                force_has_lora=num_active_loras > 0,
-                # `force_num_active_loras` is used for cudagraph capture; because we
-                # need to capture graphs for specific num_active_loras counts
-                force_num_active_loras=num_active_loras,
-            )
+        ) = self._determine_batch_execution_and_padding(
+            num_tokens=num_tokens_unpadded,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens,
+            max_num_scheduled_tokens=max_query_len,
+            use_cascade_attn=False,
+            allow_microbatching=allow_microbatching,
+            force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
+            # `force_uniform_decode` is used for cudagraph capture; because for
+            # capturing mixed prefill-decode batches, we sometimes use
+            # num_tokens == num_reqs which looks like a uniform decode batch to the
+            # dispatcher; but we actually want to capture a piecewise cudagraph
+            force_uniform_decode=uniform_decode,
+            # `force_has_lora` is used for cudagraph capture; because LoRA is
+            # activated later in the context manager, but we need to know the
+            # LoRA state when determining the batch descriptor for capture
+            force_has_lora=num_active_loras > 0,
+            # `force_num_active_loras` is used for cudagraph capture; because we
+            # need to capture graphs for specific num_active_loras counts
+            force_num_active_loras=num_active_loras,
         )
 
         if cudagraph_runtime_mode is None:

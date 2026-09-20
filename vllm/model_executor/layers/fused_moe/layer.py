@@ -25,9 +25,6 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.fused_moe.shared_expert_fusion import (
-    maybe_build_shared_expert_fusion,
-)
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -36,6 +33,9 @@ from vllm.model_executor.layers.fused_moe.router.router_factory import (
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
+)
+from vllm.model_executor.layers.fused_moe.shared_expert_fusion import (
+    maybe_build_shared_expert_fusion,
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,

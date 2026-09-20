@@ -1795,9 +1795,14 @@ class DeepseekV2Model(nn.Module):
                             else:
                                 # Routed experts are no longer contiguous:
                                 # rank r's block starts at r*S, not r*R.
-                                expert_id = expert_id + (
-                                    expert_id // ep_shared_fusion.routed_slots_per_rank
-                                ) * ep_shared_fusion.num_shared_experts
+                                expert_id = (
+                                    expert_id
+                                    + (
+                                        expert_id
+                                        // ep_shared_fusion.routed_slots_per_rank
+                                    )
+                                    * ep_shared_fusion.num_shared_experts
+                                )
 
                         # Do not modify `name` since the loop may continue here
                         # Instead, create a new variable

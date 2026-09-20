@@ -87,9 +87,7 @@ class MlbEplbPolicy(AbstractEplbPolicy):
         # every other algorithm's CPU numpy solve, ultraep's is a CUDA
         # kernel -- it stays on-device rather than following weight.cpu().
         logical_count = (
-            weight.float().cpu()
-            if per_rank_weight is None
-            else per_rank_weight.float()
+            weight.float().cpu() if per_rank_weight is None else per_rank_weight.float()
         )
         # vLLM passes num_groups=0 for models without expert groups; MLB
         # expresses "no grouping" as a single group.
