@@ -319,7 +319,7 @@ def test_snapshot_ignores_uncommitted_ultraep_tables():
 
 
 def test_synthesized_default_prefers_local_replicas():
-    """vLLM keeps no per-rank dispatch table, so the adapter builds one.
+    """VLLM keeps no per-rank dispatch table, so the adapter builds one.
     It must prefer a replica this rank owns -- that is the locality SGLang
     gets for free by collapsing its candidate list."""
     from moe_load_balancer.adapters.vllm import nearest_replica_table
@@ -777,7 +777,7 @@ def test_async_placement_commits_are_delivered_on_the_main_thread():
 
 
 def test_a_policy_without_placement_state_needs_no_such_delivery():
-    """static routes from the committed map directly, so there is nothing
+    """Static routes from the committed map directly, so there is nothing
     cached that a placement change could invalidate."""
     rt = _runtime("static")
     assert rt.requires_placement_state is False

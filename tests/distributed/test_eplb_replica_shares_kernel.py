@@ -177,8 +177,9 @@ def test_matching_the_collective_does_not_publish_zero_counts():
     rt._logical_count_ready = False
     rt._count_scratch = None
 
-    published = torch.tensor([[3.0, 1.0, 0, 0, 0, 0, 0, 0],
-                              [0, 2.0, 5.0, 0, 0, 0, 0, 0]])
+    published = torch.tensor(
+        [[3.0, 1.0, 0, 0, 0, 0, 0, 0], [0, 2.0, 5.0, 0, 0, 0, 0, 0]]
+    )
     rt._logical_count_local.copy_(published)
 
     class _Group:

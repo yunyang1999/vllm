@@ -1134,7 +1134,7 @@ class MlbRoutingRuntime:
             new_indices=new_np,
             expert_weights=self._ultraep_expert_weights[layer_id],
             expert_weights_buffers=self._ultraep_expert_buffer,
-            cuda_stream=None,
+            stream=None,
             ep_rank=self.ep_rank,
             communicator=self._ultraep_communicator,
             layer_idx=layer_id,
@@ -1168,7 +1168,6 @@ class MlbRoutingRuntime:
         the extra top-k column itself, applying 1/routed_scaling_factor as that
         column's weight in the layer (see shared_expert_fusion.py).
         """
-
         from moe_load_balancer.adapters.vllm import (
             to_routing_request,
             to_vllm_shared_expert_rank,

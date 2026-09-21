@@ -88,6 +88,21 @@ def test_multiple_expert_groups_use_grouped_topk() -> None:
     )
 
     assert isinstance(router, GroupedTopKRouter)
+    assert not router.skip_padding
+
+
+def test_grouped_topk_padding_skip_must_be_enabled() -> None:
+    router = create_fused_moe_router(
+        top_k=4,
+        global_num_experts=128,
+        use_grouped_topk=True,
+        num_expert_group=8,
+        topk_group=4,
+        skip_padding=True,
+    )
+
+    assert isinstance(router, GroupedTopKRouter)
+    assert router.skip_padding
 
 
 def test_degenerate_grouped_config_with_bias_uses_topk_bias() -> None:
@@ -215,8 +230,7 @@ def assert_routing_results_close(
     rtol: float = 1e-3,
     atol: float = 1e-3,
 ):
-    """
-    Compare routing results, sorting by expert ID first to handle non-deterministic
+    """Compare routing results, sorting by expert ID first to handle non-deterministic
     ordering from sorted=False in topk.
     """
     # Sort both results by expert IDs for consistent comparison
@@ -295,8 +309,7 @@ def assert_aiter_routing_valid(
 def baseline_fused_topk(
     router_logits: torch.Tensor, top_k: int, renormalize: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Baseline for standard fused top-k routing.
+    """Baseline for standard fused top-k routing.
 
     Algorithm:
     1. Apply softmax to router logits
@@ -321,8 +334,7 @@ def baseline_fused_topk_bias(
     e_score_correction_bias: torch.Tensor,
     routed_scaling_factor: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Baseline for fused top-k with bias correction.
+    """Baseline for fused top-k with bias correction.
 
     Algorithm:
     1. Apply softmax to router logits
@@ -365,8 +377,7 @@ def baseline_grouped_topk(
     e_score_correction_bias: torch.Tensor | None,
     routed_scaling_factor: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Baseline for grouped top-k routing (e.g., DeepSeek).
+    """Baseline for grouped top-k routing (e.g., DeepSeek).
 
     Algorithm:
     1. Apply scoring function (softmax or sigmoid)
@@ -437,8 +448,7 @@ def baseline_grouped_topk(
 def baseline_custom_llama4(
     router_logits: torch.Tensor, top_k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Baseline for Llama4 custom routing.
+    """Baseline for Llama4 custom routing.
 
     Algorithm:
     1. Select top-k expert indices (without softmax)
@@ -1047,10 +1057,14 @@ def test_a_policy_may_resolve_replicas_itself_and_still_be_recorded():
     )
 
     torch.manual_seed(0)
-    num_logical, num_physical, ep = 8, 12, 2
+    num_logical, num_physical = 8, 12
     tokens, topk = 32, 2
-    logical_to_physical = torch.full((num_logical, 2), -1, dtype=torch.int32, device="cuda")
-    logical_to_physical[:, 0] = torch.arange(num_logical, dtype=torch.int32, device="cuda")
+    logical_to_physical = torch.full(
+        (num_logical, 2), -1, dtype=torch.int32, device="cuda"
+    )
+    logical_to_physical[:, 0] = torch.arange(
+        num_logical, dtype=torch.int32, device="cuda"
+    )
     logical_to_physical[:4, 1] = torch.arange(
         num_logical, num_physical, dtype=torch.int32, device="cuda"
     )
@@ -1111,17 +1125,22 @@ def test_policy_resolved_ids_stay_valid_and_fully_recorded():
     from moe_load_balancer.adapters.vllm import nearest_replica_table
 
     defaults = nearest_replica_table(
-        l2p.to(torch.int64), counts.to(torch.int64),
-        ep_rank=3, num_local_physical_experts=per_rank,
+        l2p.to(torch.int64),
+        counts.to(torch.int64),
+        ep_rank=3,
+        num_local_physical_experts=per_rank,
     ).to(torch.int32)
     resolved = defaults[topk.to(torch.int64)]
 
     load = torch.zeros(NP, dtype=torch.int32, device="cuda")
     out = _eplb_map_and_record_triton(
-        topk_ids=topk, logical_to_physical_map=l2p, logical_replica_count=counts,
+        topk_ids=topk,
+        logical_to_physical_map=l2p,
+        logical_replica_count=counts,
         expert_load_view=load,
         record_enabled=torch.tensor(1, dtype=torch.int32, device="cuda"),
-        num_unpadded_tokens=None, physical_ids=resolved,
+        num_unpadded_tokens=None,
+        physical_ids=resolved,
     )
     assert torch.equal(out, resolved), "the policy's ids were not used verbatim"
 

@@ -19,7 +19,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
 
-if current_platform.is_cuda_alike():
+if current_platform.is_cuda_alike() or current_platform.is_xpu():
 
     @triton.jit
     def _eplb_map_and_record_i32_kernel(
@@ -295,8 +295,7 @@ else:
 
 
 class BaseRouter(FusedMoERouter):
-    """
-    Base router class that provides common functionality for all router implementations.
+    """Base class providing common functionality for all router implementations.
 
     This class implements the template method pattern where select_experts() handles
     common pre-processing and post-processing, delegating the actual routing logic
@@ -309,11 +308,11 @@ class BaseRouter(FusedMoERouter):
         global_num_experts: int,
         eplb_state: EplbLayerState | None = None,
     ):
-        """
-        Args:
-            top_k: Number of experts to select per token
-            global_num_experts: Total number of experts
-            eplb_state: Optional EPLBLayerState for load balancing
+        """Args:
+        top_k: Number of experts to select per token
+        global_num_experts: Total number of experts
+        eplb_state: Optional EPLBLayerState for load balancing
+
         """
         super().__init__(eplb_state=eplb_state)
         self.top_k = top_k
@@ -390,8 +389,7 @@ class BaseRouter(FusedMoERouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute the actual routing logic.
+        """Compute the actual routing logic.
 
         This method must be implemented by subclasses to provide the specific
         routing algorithm (e.g., grouped_topk, fused_topk, custom routing, etc.).
@@ -400,9 +398,11 @@ class BaseRouter(FusedMoERouter):
             hidden_states: Input hidden states
             router_logits: Router logits for expert selection
             indices_type: Desired dtype for expert indices (may be None)
+            input_ids: Token ids, for routers that condition on them
 
         Returns:
             tuple of (topk_weights, topk_ids)
+
         """
         raise NotImplementedError
 
@@ -414,8 +414,7 @@ class BaseRouter(FusedMoERouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Route the input hidden states to the top-k experts based on the
+        """Route the input hidden states to the top-k experts based on the
         router logits.
 
         This method implements the template method pattern:
@@ -432,6 +431,7 @@ class BaseRouter(FusedMoERouter):
             **Compatibility**: When EPLB is not enabled, the returned ids are
             equivalent to global logical ids, so should be compatible with
             plain MoE implementations without redundant experts.
+
         """
         # Step 1: Validate EPLB state
         self._validate_eplb_state()

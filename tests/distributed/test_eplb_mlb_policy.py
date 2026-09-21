@@ -154,14 +154,14 @@ def test_mlb_algorithms_selectable(monkeypatch, algorithm):
 
 
 def test_no_expert_groups():
-    """vLLM passes num_groups=0 for models without expert groups."""
+    """VLLM passes num_groups=0 for models without expert groups."""
     weight = _skewed_load()
     phy2log = MlbEplbPolicy.rebalance_experts(weight, NUM_REPLICAS, 0, 1, NUM_RANKS)
     _assert_valid_placement(phy2log)
 
 
 def test_ep_rank_reaches_the_placement_request(monkeypatch):
-    """ultraep's placement kernel solves once per EP rank and validates the
+    """Ultraep's placement kernel solves once per EP rank and validates the
     value is in range, so the caller's rank must reach the request -- every
     other algorithm ignores it, but the plumbing is shared."""
     import vllm.distributed.eplb.mlb_runtime as mlb_runtime

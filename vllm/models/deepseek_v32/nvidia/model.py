@@ -10,13 +10,15 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.layers.fused_embed_norm import (
+    fused_embed_norm,
+    has_full_vocab_on_rank,
+    make_input_embedding,
+)
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -25,6 +27,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
     DeepseekV2MLP,
     DeepseekV2MoE,
+    _find_shared_expert_fusion,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
@@ -44,6 +47,10 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.mla.index_group import (
+    SparseMLAIndexGroupBuilder,
+    get_sparse_mla_index_group_max_rows,
+)
 
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
 
@@ -55,6 +62,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         prefix: str,
         config=None,
         topk_indices_buffer: torch.Tensor | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         super().__init__()
 
@@ -78,6 +86,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             config=config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            index_group_builder=index_group_builder,
         )
 
         if (
@@ -116,12 +125,18 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        attn_in: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         full_num_tokens = positions.shape[0]
 
         if residual is None:
+            # First layer: hidden_states is the embedding (the residual).
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            # ``attn_in`` is input_layernorm(embedding) already computed fused
+            # with the embedding gather; otherwise apply it here.
+            hidden_states = (
+                attn_in if attn_in is not None else self.input_layernorm(hidden_states)
+            )
         elif self.use_sequence_parallel:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
@@ -174,29 +189,38 @@ class DeepseekV32Model(torch.nn.Module):
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
         self.is_v32 = True
-        topk_indices_buffer = torch.empty(
+        # On the model, not a local: the MTP proposer shares it with the draft.
+        self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
             dtype=torch.int32,
             device=self.device,
         )
+        index_group_builder = SparseMLAIndexGroupBuilder(
+            self.topk_indices_buffer,
+            get_sparse_mla_index_group_max_rows(vllm_config),
+        )
 
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
+            self.embed_tokens = make_input_embedding(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens",
+                tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             )
         else:
             self.embed_tokens = PPMissingLayer()
+        # The fused embed+norm gather needs the full table on-rank.
+        self.replicated_embed = has_full_vocab_on_rank(self.embed_tokens)
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV32DecoderLayer(
                 vllm_config=vllm_config,
                 prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
+                topk_indices_buffer=self.topk_indices_buffer,
+                index_group_builder=index_group_builder,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -222,9 +246,21 @@ class DeepseekV32Model(torch.nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        attn_in = None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+            elif self.replicated_embed:
+                assert input_ids is not None
+                # Full table on-rank: gather the embedding and the first layer's
+                # input_layernorm in one launch. ``attn_in`` is the pre-normed
+                # attention input; ``hidden_states`` is the (residual) embedding.
+                hidden_states, attn_in = fused_embed_norm(
+                    input_ids,
+                    self.embed_tokens.weight,
+                    chain_weight=self.layers[self.start_layer].input_layernorm.weight,
+                    eps=self.config.rms_norm_eps,
+                )
             else:
                 assert input_ids is not None
                 hidden_states = self.embed_input_ids(input_ids)
@@ -242,6 +278,8 @@ class DeepseekV32Model(torch.nn.Module):
                     forward_context.is_padding, hidden_states
                 )
             hidden_states = sp_shard(hidden_states)
+            if attn_in is not None:
+                attn_in = sp_shard(attn_in)
             assert residual is None, "Currently, SP is not supported with PP"
 
         aux_hidden_states = []
@@ -253,7 +291,8 @@ class DeepseekV32Model(torch.nn.Module):
                 aux_hidden_states.append(
                     hidden_states if residual is None else hidden_states + residual
                 )
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
+            attn_in = None
 
         if not get_pp_group().is_last_rank:
             assert not self.use_sequence_parallel, (
@@ -288,6 +327,16 @@ class DeepseekV32Model(torch.nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # DSA-only: MLA (fused_qkv_a_proj) + the fused indexer wk/weights_proj +
         # routed experts. No MHA (qkv_proj) or ROCm shared-expert-fusion paths.
+        #
+        # The EP-dispatched shared expert (VLLM_FUSE_SHARED_EXPERTS) is handled:
+        # when the MoE layers were built with it, the replicated `shared_experts`
+        # MLP does not exist and the checkpoint's shared-expert tensors go into
+        # this rank's fused expert slot, while routed ids shift past the shared
+        # slots of every earlier rank -- the same routing as
+        # DeepseekV2Model.load_weights, mirrored here because this flat model
+        # has its own loader. Read off a built layer, so the slot the weight
+        # lands in is by construction the one the router sends tokens to.
+        ep_shared_fusion = _find_shared_expert_fusion(self)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -325,11 +374,16 @@ class DeepseekV32Model(torch.nn.Module):
             ):
                 continue
 
+            is_fused_shared_expert_weight = (
+                ep_shared_fusion is not None and "mlp.shared_experts" in name
+            )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 # Experts are handled below; skip here before the name rewrite.
                 if ("mlp.experts." in name) and name not in params_dict:
+                    continue
+                if is_fused_shared_expert_weight:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
                 if (
@@ -346,12 +400,34 @@ class DeepseekV32Model(torch.nn.Module):
                 break
             else:
                 is_expert_weight = False
+                # The shared expert's tensor is routed like an expert weight,
+                # under an expert-style name the mapping recognises.
+                expert_name = (
+                    name.replace("mlp.shared_experts", "mlp.experts.0")
+                    if is_fused_shared_expert_weight
+                    else name
+                )
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping  # type: ignore[assignment]
-                    if weight_name not in name:
+                    if weight_name not in expert_name:
                         continue
                     is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
+                    if ep_shared_fusion is not None:
+                        if is_fused_shared_expert_weight:
+                            # This rank's own copy, in its own slot; every rank
+                            # loads its own from the same checkpoint tensor.
+                            expert_id = ep_shared_fusion.shared_expert_global_ids(
+                                ep_shared_fusion.ep_rank
+                            )[0]
+                        else:
+                            # Routed experts are no longer contiguous: rank r's
+                            # block starts at r*S, not r*R.
+                            expert_id = (
+                                expert_id
+                                + (expert_id // ep_shared_fusion.routed_slots_per_rank)
+                                * ep_shared_fusion.num_shared_experts
+                            )
+                    name_mapped = expert_name.replace(weight_name, param_name)
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
                     param = params_dict[name_mapped]
