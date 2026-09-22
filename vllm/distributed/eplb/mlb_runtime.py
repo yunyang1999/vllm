@@ -987,7 +987,7 @@ class MlbRoutingRuntime:
             return
 
         from moe_load_balancer.adapters.vllm import to_placement_request
-        from moe_load_balancer.kernels.expert_count import count_logical_experts
+        from moe_load_balancer.kernels.ops.counting import count_logical_experts
 
         from vllm.distributed import get_ep_group
 
@@ -1172,7 +1172,7 @@ class MlbRoutingRuntime:
             to_routing_request,
             to_vllm_shared_expert_rank,
         )
-        from moe_load_balancer.kernels.expert_count import count_logical_experts
+        from moe_load_balancer.kernels.ops.counting import count_logical_experts
 
         self._last_physical_ids = None
         self._last_shared_expert_rank = None
