@@ -496,7 +496,7 @@ class MlbRoutingRuntime:
             )
             return
 
-        from moe_load_balancer import RefreshGate
+        from moe_load_balancer.policies.l1 import RefreshGate
 
         self._ultraep_expert_weights = expert_weights
         self._ultraep_expert_buffer = expert_buffer
