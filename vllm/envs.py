@@ -284,6 +284,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HT_USE_MNNVL: bool = False
     VLLM_DEEPEP_V2_RDMA_GBS: float = 0.0
     VLLM_DEEPEP_V2_NVLINK_GBS: float = 0.0
+    VLLM_EPLB_DUMP_LOAD_PATH: str | None = None
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
@@ -2002,6 +2003,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPEP_V2_NVLINK_GBS": lambda: float(
         os.getenv("VLLM_DEEPEP_V2_NVLINK_GBS", "0")
     ),
+    # If set, EplbState dumps the recorded global logical expert load (and the
+    # placement it was recorded under) to <path>.step<N>.pt at every
+    # rearrangement step, from EP rank 0. Observation only; off by default.
+    "VLLM_EPLB_DUMP_LOAD_PATH": lambda: os.getenv("VLLM_EPLB_DUMP_LOAD_PATH"),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput
     # on system supports multi-node nvlink (e.g GB200).
