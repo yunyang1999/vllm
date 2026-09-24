@@ -33,6 +33,7 @@ from dataclasses import dataclass
 import torch
 from torch.distributed import ProcessGroup, all_gather_into_tensor, all_reduce
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
 from vllm.distributed.parallel_state import (
@@ -984,6 +985,33 @@ class EplbState:
             per_rank_expert_load_windows = [None] * len(global_expert_load_windows)
             global_expert_load_windows = self._allreduce_list(
                 global_expert_load_windows
+            )
+
+        # Env-gated, write-only observation hook (no-op unless the variable is
+        # set): dump the global *logical* expert load. rank_imbalance is a pure
+        # function of (logical load, placement, replica routing), so one recorded
+        # load lets every policy x redundancy combination be scored on CPU
+        # afterwards instead of re-serving the model once per arm.
+        _dump = envs.VLLM_EPLB_DUMP_LOAD_PATH
+        if _dump and not is_profile and ep_group.rank() == 0:
+            _st = next(iter(self.model_states.values()))
+            torch.save(
+                {
+                    "logical_expert_load": global_expert_load_windows[0].cpu(),
+                    "physical_to_logical_map": _st.physical_to_logical_map.cpu(),
+                    "num_logical_experts": _st.model.num_logical_experts,
+                    "num_physical_experts": _st.model.num_physical_experts,
+                    "num_moe_layers": _st.model.num_moe_layers,
+                    "num_expert_groups": _st.model.num_expert_groups,
+                    "ep_size": ep_group.size(),
+                    "step": int(self.expert_rearrangement_step),
+                },
+                f"{_dump}.step{int(self.expert_rearrangement_step)}.pt",
+            )
+            logger.info(
+                "EPLB: dumped logical expert load to %s.step%d.pt",
+                _dump,
+                int(self.expert_rearrangement_step),
             )
 
         # TODO(bowen): Treat differently for prefill and decode nodes
