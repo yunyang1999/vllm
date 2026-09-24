@@ -31,6 +31,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -408,6 +409,36 @@ class MlbRoutingRuntime:
         # the weight commit separately -- with a device sync on each, then
         # reports and disarms. Same shape as MLB_TIME_L2 above.
         self._time_refresh = int(os.environ.get("MLB_TIME_REFRESH", "0"))
+        # How UltraEP's fast refresh lands re-solved replica weight. Upstream
+        # UltraEP does this with a one-sided weight_sync (masters stay put,
+        # replica slots are refilled from the owning master); the movers below
+        # are that idea on vLLM's own tensors, best first:
+        #   symm    -- one-sided NVLink puts through torch symmetric memory,
+        #              completed with pairwise signals (_commit_symm)
+        #   direct  -- pairwise send/recv over the EPLB communicator, no
+        #              staging buffer (_commit_direct)
+        #   generic -- vLLM's periodic-rearrangement mover (move_to_buffer),
+        #              which also handles the one case the others do not: the
+        #              first refresh after a checkpointed placement, when the
+        #              masters themselves move
+        # MLB_ULTRAEP_MOVER=auto (default) tries symm, then direct. Every
+        # mover leaves a layer whose masters move to generic.
+        self._ultraep_mover = os.environ.get("MLB_ULTRAEP_MOVER", "auto").strip()
+        self._ultraep_mover_warned = False
+        self._symm_hdl: Any = None
+        self._symm_buf: torch.Tensor | None = None
+        self._symm_layout: list[tuple[int, int, torch.dtype, tuple[int, ...]]] = []
+        self._symm_expert_nbytes = 0
+        # MLB_ULTRAEP_LAGGED_APPLY (default 1): solve on this forward, land the
+        # plan (routing snapshot + weights) on the layer's next forward. Keeps
+        # the plan's device->host copy off the critical path -- no per-layer
+        # GPU sync -- at the price of one step of staleness. 0 restores the
+        # synchronous same-batch apply.
+        self._ultraep_lagged = (
+            os.environ.get("MLB_ULTRAEP_LAGGED_APPLY", "1").strip() != "0"
+        )
+        self._ultraep_pending: dict[int, tuple[Any, ...]] = {}
+        self._ultraep_pending_host: dict[int, torch.Tensor] = {}
         self._solve_us: list[float] = []
         self._commit_us: list[float] = []
         self._commit_host_us: list[float] = []
@@ -496,7 +527,10 @@ class MlbRoutingRuntime:
             )
             return
 
-        from moe_load_balancer import RefreshGate
+        try:
+            from moe_load_balancer.policies.l1 import RefreshGate
+        except ImportError:  # older MLB exported it from the package root
+            from moe_load_balancer import RefreshGate
 
         self._ultraep_expert_weights = expert_weights
         self._ultraep_expert_buffer = expert_buffer
@@ -508,11 +542,13 @@ class MlbRoutingRuntime:
         logger.info(
             "UltraEP fast refresh enabled (interval=%d representative "
             "batches, min_tokens=%d, num_layers=%d, "
-            "num_local_physical=%d)",
+            "num_local_physical=%d, mover=%s, lagged_apply=%s)",
             interval,
             self._ultraep_min_representative_tokens,
             len(expert_weights),
             self._ultraep_num_local_physical,
+            self._ultraep_mover,
+            self._ultraep_lagged,
         )
 
     def finalize_step_counts(self) -> None:
@@ -926,6 +962,10 @@ class MlbRoutingRuntime:
             return
         if self._ultraep_rank_quota_prefix is None:
             return
+        if self._ultraep_lagged:
+            # The plan solved on this layer's previous forward lands now
+            # (routing snapshot, then weights), before this forward's routing.
+            self._ultraep_apply_pending(layer_id)
         if _current_stage() == "decode":
             # UltraEP is explicitly a prefill-time algorithm (the paper's own
             # scoping; SGLang's reference should_refresh gates the same way,
@@ -1016,6 +1056,9 @@ class MlbRoutingRuntime:
         if self._time_refresh:
             torch.cuda.synchronize()
             self._solve_us.append((time.perf_counter() - _ts) * 1e6)
+        if self._ultraep_lagged:
+            self._ultraep_stage_pending(layer_id, plan)
+            return
 
         # The request carried one synthetic layer (dim 0 of per_rank_count),
         # so the plan's own layer index is always 0 regardless of layer_id --
@@ -1046,59 +1089,65 @@ class MlbRoutingRuntime:
         # for _snapshot to route through them.
         self._ultraep_committed_layers.add(layer_id)
 
-        if self._time_refresh:
-            torch.cuda.synchronize()
-            _tc = time.perf_counter()
-        self._commit_placement_weights(
-            layer_id, placement_change[0], placement_change[1]
-        )
-        if self._time_refresh:
-            _host = (time.perf_counter() - _tc) * 1e6
-            torch.cuda.synchronize()
-            _dt = (time.perf_counter() - _tc) * 1e6
-            self._commit_host_us.append(_host)
-            # How much this commit actually had to move: slots whose occupant
-            # changed. A refresh that re-solves to the same placement moves
-            # nothing, and the first commit for a layer moves everything, so
-            # the duration alone says very little without this.
-            _moved = int((placement_change[0] != placement_change[1]).sum())
-            self._commit_us.append((_moved, _dt))
-            if len(self._commit_us) >= self._time_refresh:
-                import statistics
+        self._timed_commit(layer_id, placement_change[0], placement_change[1])
 
-                def _q(v, f):
-                    return sorted(v)[min(int(f * len(v)), len(v) - 1)] if v else 0.0
+    def _timed_commit(self, layer_id: int, old_np: Any, new_np: Any) -> None:
+        """``_commit_placement_weights``, wrapped in the MLB_TIME_REFRESH timing
+        when it is armed: host issue time and device completion time of each
+        commit, reported once with the solve times and then disarmed. Shared by
+        the same-forward and the next-forward (lagged) apply paths."""
+        if not self._time_refresh:
+            self._commit_placement_weights(layer_id, old_np, new_np)
+            return
+        torch.cuda.synchronize()
+        _tc = time.perf_counter()
+        self._commit_placement_weights(layer_id, old_np, new_np)
+        _host = (time.perf_counter() - _tc) * 1e6
+        torch.cuda.synchronize()
+        _dt = (time.perf_counter() - _tc) * 1e6
+        self._commit_host_us.append(_host)
+        # How much this commit actually had to move: slots whose occupant
+        # changed. A refresh that re-solves to the same placement moves
+        # nothing, and the first commit for a layer moves everything, so
+        # the duration alone says very little without this.
+        _moved = int((old_np != new_np).sum())
+        self._commit_us.append((_moved, _dt))
+        if len(self._commit_us) >= self._time_refresh:
+            import statistics
 
-                idle = [d for m, d in self._commit_us if m == 0]
-                moving = [(m, d) for m, d in self._commit_us if m > 0]
-                logger.info(
-                    "MLB refresh cost over %d refreshes: solve median=%.0f us "
-                    "p90=%.0f us | commits that moved nothing: n=%d median=%.0f us "
-                    "| commits that moved slots: n=%d median slots=%.0f "
-                    "median=%.0f us p90=%.0f us max=%.0f us",
-                    len(self._commit_us),
-                    statistics.median(self._solve_us),
-                    _q(self._solve_us, 0.9),
-                    len(idle),
-                    statistics.median(idle) if idle else 0.0,
-                    len(moving),
-                    statistics.median([m for m, _ in moving]) if moving else 0.0,
-                    statistics.median([d for _, d in moving]) if moving else 0.0,
-                    _q([d for _, d in moving], 0.9),
-                    max([d for _, d in moving], default=0.0),
-                )
-                logger.info(
-                    "MLB commit host-vs-device: host median=%.0f us | "
-                    "device-complete median=%.0f us -- if the host figure is "
-                    "well below the device one, the device is the binding "
-                    "constraint and shaving host work changes nothing",
-                    statistics.median(self._commit_host_us),
-                    statistics.median([d for _, d in self._commit_us]),
-                )
-                self._commit_host_us.clear()
-                self._solve_us.clear()
-                self._commit_us.clear()
-                self._time_refresh = 0
+            def _q(v, f):
+                return sorted(v)[min(int(f * len(v)), len(v) - 1)] if v else 0.0
+
+            idle = [d for m, d in self._commit_us if m == 0]
+            moving = [(m, d) for m, d in self._commit_us if m > 0]
+            logger.info(
+                "MLB refresh cost over %d refreshes: solve median=%.0f us "
+                "p90=%.0f us | commits that moved nothing: n=%d median=%.0f us "
+                "| commits that moved slots: n=%d median slots=%.0f "
+                "median=%.0f us p90=%.0f us max=%.0f us",
+                len(self._commit_us),
+                statistics.median(self._solve_us),
+                _q(self._solve_us, 0.9),
+                len(idle),
+                statistics.median(idle) if idle else 0.0,
+                len(moving),
+                statistics.median([m for m, _ in moving]) if moving else 0.0,
+                statistics.median([d for _, d in moving]) if moving else 0.0,
+                _q([d for _, d in moving], 0.9),
+                max([d for _, d in moving], default=0.0),
+            )
+            logger.info(
+                "MLB commit host-vs-device: host median=%.0f us | "
+                "device-complete median=%.0f us -- if the host figure is "
+                "well below the device one, the device is the binding "
+                "constraint and shaving host work changes nothing",
+                statistics.median(self._commit_host_us),
+                statistics.median([d for _, d in self._commit_us]),
+            )
+            self._commit_host_us.clear()
+            self._solve_us.clear()
+            self._commit_us.clear()
+            self._time_refresh = 0
 
     def _commit_placement_weights(
         self,
@@ -1121,6 +1170,14 @@ class MlbRoutingRuntime:
             # move, and skipping is safe for the EP group precisely because
             # every rank compares the same two EP-wide arrays and so reaches
             # this the same way.
+            return
+        if self._ultraep_mover in ("auto", "symm") and self._commit_symm(
+            layer_id, old_np, new_np
+        ):
+            return
+        if self._ultraep_mover in ("auto", "direct") and self._commit_direct(
+            layer_id, old_np, new_np
+        ):
             return
 
         from vllm.distributed.eplb.rebalance_execute import (
@@ -1146,6 +1203,262 @@ class MlbRoutingRuntime:
             new_indices=new_np,
             ep_rank=self.ep_rank,
         )
+
+    def _ultraep_stage_pending(self, layer_id: int, plan: Any) -> None:
+        """Park a solved plan for this layer until its next forward.
+
+        The plan's GPU tensors are kept as-is (plan() allocates fresh ones per
+        solve, so nothing is overwritten underneath us) and the (live, solved)
+        physical->logical pair is copied to pinned host memory asynchronously
+        on the current stream, with an event marking completion. Nothing here
+        waits on the device.
+        """
+        live = self.physical_to_logical_map[layer_id]
+        solved = plan.physical_to_logical_map[0].to(live.dtype)
+        host = self._ultraep_pending_host.get(layer_id)
+        if host is None:
+            host = torch.empty((2, live.numel()), dtype=live.dtype, pin_memory=True)
+            self._ultraep_pending_host[layer_id] = host
+        host.copy_(torch.stack((live, solved)), non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self._ultraep_pending[layer_id] = (
+            solved,
+            plan.logical_to_all_physical_map[0],
+            plan.logical_to_physical_count[0],
+            plan.metadata["rank_quota_prefix"][0],
+            host,
+            ev,
+        )
+
+    def _ultraep_apply_pending(self, layer_id: int) -> None:
+        """Land the plan staged on this layer's previous forward: snapshot first
+        (the routing that follows reads it), then the weight sync on the same
+        stream, so the experts kernel downstream sees matching weights. By now
+        the pinned copy finished a whole step ago, so the event wait is free.
+        """
+        pending = self._ultraep_pending.pop(layer_id, None)
+        if pending is None:
+            return
+        solved, l2p, counts, quota, host, ev = pending
+        ev.synchronize()
+        change = host.numpy()
+        old_np = change[0].copy()
+        new_np = change[1].copy()
+        self.physical_to_logical_map[layer_id].copy_(solved)
+        self._ultraep_logical_to_physical[layer_id].copy_(l2p)
+        self._ultraep_replica_counts[layer_id].copy_(counts)
+        self._ultraep_rank_quota_prefix[layer_id].copy_(quota)
+        self._ultraep_committed_layers.add(layer_id)
+        self._timed_commit(layer_id, old_np, new_np)
+
+    def _replica_changes(self, layer_id: int, old_np: Any, new_np: Any) -> list | None:
+        """Replica slots that acquired a new expert, as ``(dst_rank, k)`` pairs
+        with ``k`` the slot's index among that rank's replica slots -- or None
+        when either placement is not on the fixed-master layout.
+
+        Both fast movers rest on one assumption: the first ``masters_per_rank``
+        slots of every rank hold that rank's own logical experts, in order, on
+        both sides of the change. The first refresh after loading a
+        checkpointed (EPLB-permuted) placement breaks it -- that refresh moves
+        every master home -- and is left to the generic mover.
+        """
+        ep_size = self.ep_size
+        num_local = self._ultraep_num_local_physical
+        masters_per_rank = self.num_logical_experts // ep_size
+        new_grid = np.asarray(new_np).reshape(ep_size, num_local)
+        old_grid = np.asarray(old_np).reshape(ep_size, num_local)
+        expected = (
+            np.arange(ep_size)[:, None] * masters_per_rank
+            + np.arange(masters_per_rank)[None, :]
+        )
+        if not (
+            np.array_equal(new_grid[:, :masters_per_rank], expected)
+            and np.array_equal(old_grid[:, :masters_per_rank], expected)
+        ):
+            if not self._ultraep_mover_warned:
+                self._ultraep_mover_warned = True
+                logger.info(
+                    "MLB weight sync: layer %d moves master slots (placement not "
+                    "on the fixed-master layout); the generic mover handles it and "
+                    "the fast path takes over from the next refresh",
+                    layer_id,
+                )
+            return None
+        return np.argwhere(
+            (new_grid[:, masters_per_rank:] != old_grid[:, masters_per_rank:])
+            & (new_grid[:, masters_per_rank:] >= 0)
+        ).tolist()
+
+    def _commit_direct(self, layer_id: int, old_np: Any, new_np: Any) -> bool:
+        """Weight sync over the EPLB communicator: masters stay put, and every
+        replica slot whose expert changed receives it straight from the rank
+        holding the master, in one send/recv group per layer -- no staging
+        buffer, no second local copy. Sources are master slots (never written
+        by a refresh) and destinations are replica slots (each written by one
+        recv), so stream order is the only ordering needed.
+
+        Returns False to hand the layer to the generic mover.
+        """
+        changed = self._replica_changes(layer_id, old_np, new_np)
+        if changed is None:
+            return False
+        masters_per_rank = self.num_logical_experts // self.ep_size
+        new_grid = np.asarray(new_np).reshape(
+            self.ep_size, self._ultraep_num_local_physical
+        )
+        weights = self._ultraep_expert_weights[layer_id]
+        comm = self._ultraep_communicator
+        posted = False
+        for dst_rank, k in changed:
+            dst_row = masters_per_rank + k
+            expert = int(new_grid[dst_rank, dst_row])
+            src_rank, src_row = divmod(expert, masters_per_rank)
+            if dst_rank == src_rank:
+                if self.ep_rank == dst_rank:
+                    for w in weights:
+                        w[dst_row].copy_(w[src_row], non_blocking=True)
+                continue
+            if self.ep_rank == src_rank:
+                comm.add_send([w[src_row] for w in weights], dst_rank, expert_id=expert)
+                posted = True
+            elif self.ep_rank == dst_rank:
+                comm.add_recv([w[dst_row] for w in weights], src_rank, expert_id=expert)
+                posted = True
+        if posted:
+            comm.execute()
+        return True
+
+    def _symm_setup(self) -> bool:
+        """Allocate and rendezvous the per-rank staging buffer (collective on the
+        EP group, so every rank must reach its first commit together -- they do,
+        the refresh runs in lockstep).
+
+        Layout: ``[2 sets, replica slots per rank, expert bytes]``. An expert's
+        tensors (weights and scales) are packed back to back as raw bytes in the
+        order ``expert_weights[layer]`` lists them; every layer has the same
+        shapes, so one layout serves all layers. Two sets alternate with the
+        layer index: the unpack of layer L is stream-ordered before this rank's
+        all-gather for layer L+1, and every peer's puts for layer L+1 are issued
+        after that all-gather completes, so set L%2 is never overwritten while
+        it is still being read.
+
+        Returns False (and drops to the direct mover) when symmetric memory is
+        unavailable on this build.
+        """
+        if self._symm_hdl is not None:
+            return True
+        try:
+            import torch.distributed._symmetric_memory as symm
+
+            from vllm.distributed import get_ep_group
+
+            weights0 = self._ultraep_expert_weights[0]
+            layout: list[tuple[int, int, torch.dtype, tuple[int, ...]]] = []
+            off = 0
+            for w in weights0:
+                row = w[0]
+                nbytes = row.numel() * row.element_size()
+                layout.append((off, nbytes, w.dtype, tuple(row.shape)))
+                off += nbytes
+            n_rep = (
+                self._ultraep_num_local_physical
+                - self.num_logical_experts // self.ep_size
+            )
+            buf = symm.empty(
+                (2, n_rep, off), dtype=torch.uint8, device=weights0[0].device
+            )
+            hdl = symm.rendezvous(buf, group=get_ep_group().device_group)
+        except Exception as exc:
+            logger.warning(
+                "MLB weight sync: symmetric memory unavailable (%s); using the "
+                "direct send/recv mover",
+                exc,
+            )
+            self._ultraep_mover = "direct"
+            return False
+        self._symm_layout = layout
+        self._symm_expert_nbytes = off
+        self._symm_buf, self._symm_hdl = buf, hdl
+        logger.info(
+            "MLB weight sync: symmetric-memory mover ready "
+            "(%d replica slot(s) x %d MiB, 2 sets, %d tensors per expert)",
+            n_rep,
+            off >> 20,
+            len(layout),
+        )
+        return True
+
+    def _commit_symm(self, layer_id: int, old_np: Any, new_np: Any) -> bool:
+        """UltraEP weight_sync semantics over torch symmetric memory.
+
+        Every rank owning the master of an expert that some replica slot just
+        acquired writes that master straight into the acquiring rank's staging
+        slot -- a device copy into mapped peer memory, the peer does nothing --
+        then signals that peer; each acquiring rank waits for exactly the peers
+        it received from and unpacks its staging slots into its replica rows.
+        No group-wide barrier, no host round trip.
+
+        Returns False to hand the layer to the generic mover.
+        """
+        if not self._symm_setup():
+            return False
+        changed = self._replica_changes(layer_id, old_np, new_np)
+        if changed is None:
+            return False
+        masters_per_rank = self.num_logical_experts // self.ep_size
+        n_rep = self._ultraep_num_local_physical - masters_per_rank
+        new_grid = np.asarray(new_np).reshape(
+            self.ep_size, self._ultraep_num_local_physical
+        )
+        weights = self._ultraep_expert_weights[layer_id]
+        set_id = layer_id % 2
+        hdl, buf = self._symm_hdl, self._symm_buf
+        assert buf is not None
+        signal_to: set[int] = set()
+        wait_for: set[int] = set()
+        # 1. puts: I own the master -> write into the acquirer's staging slot
+        for dst_rank, k in changed:
+            expert = int(new_grid[dst_rank, masters_per_rank + k])
+            src_rank, src_row = divmod(expert, masters_per_rank)
+            if src_rank == dst_rank:
+                if self.ep_rank == dst_rank:
+                    for w in weights:
+                        w[masters_per_rank + k].copy_(w[src_row], non_blocking=True)
+                continue
+            if self.ep_rank == dst_rank:
+                wait_for.add(src_rank)
+                continue
+            if self.ep_rank != src_rank:
+                continue
+            remote = hdl.get_buffer(
+                dst_rank, (2, n_rep, self._symm_expert_nbytes), torch.uint8
+            )
+            stage = remote[set_id, k]
+            for w, (off, nbytes, _dtype, _shape) in zip(weights, self._symm_layout):
+                stage[off : off + nbytes].copy_(
+                    w[src_row].contiguous().view(-1).view(torch.uint8),
+                    non_blocking=True,
+                )
+            signal_to.add(dst_rank)
+        # 2. pairwise completion, stream-ordered after the puts
+        for dst_rank in signal_to:
+            hdl.put_signal(dst_rank, channel=0)
+        for src_rank in wait_for:
+            hdl.wait_signal(src_rank, channel=0)
+        # 3. unpack what I acquired
+        for dst_rank, k in changed:
+            if dst_rank != self.ep_rank:
+                continue
+            expert = int(new_grid[dst_rank, masters_per_rank + k])
+            if expert // masters_per_rank == self.ep_rank:
+                continue  # local copy done above
+            stage = buf[set_id, k]
+            for w, (off, nbytes, dtype, shape) in zip(weights, self._symm_layout):
+                w[masters_per_rank + k].copy_(
+                    stage[off : off + nbytes].view(dtype).view(shape), non_blocking=True
+                )
+        return True
 
     def replica_shares(
         self,
