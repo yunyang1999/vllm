@@ -280,6 +280,10 @@ if TYPE_CHECKING:
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
+    VLLM_DEEPEP_RDMA_BUFFER_SIZE_MB: int | None = None
+    VLLM_DEEPEP_HT_USE_MNNVL: bool = False
+    VLLM_DEEPEP_V2_RDMA_GBS: float = 0.0
+    VLLM_DEEPEP_V2_NVLINK_GBS: float = 0.0
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
@@ -1974,6 +1978,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The size in MB of the buffers (NVL and RDMA) used by DeepEP
     "VLLM_DEEPEP_BUFFER_SIZE_MB": lambda: int(
         os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "1024")
+    ),
+    # Size the DeepEP high-throughput RDMA buffer separately from the NVL one.
+    # DeepEP caps num_nvl_bytes at INT_MAX whenever num_rdma_bytes != 0, so the
+    # shared knob cannot give internode dispatch (EP > 8 NVL peers) more room.
+    # Unset: same as VLLM_DEEPEP_BUFFER_SIZE_MB.
+    "VLLM_DEEPEP_RDMA_BUFFER_SIZE_MB": lambda: (
+        None
+        if os.getenv("VLLM_DEEPEP_RDMA_BUFFER_SIZE_MB") is None
+        else int(os.environ["VLLM_DEEPEP_RDMA_BUFFER_SIZE_MB"])
+    ),
+    # Let DeepEP's high-throughput buffer use MNNVL (allow_mnnvl) so an EP group
+    # can span trays of a multi-node NVLink domain (e.g. GB200 NVL72); the
+    # default IPC path is node-local and fails at startup there.
+    "VLLM_DEEPEP_HT_USE_MNNVL": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_USE_MNNVL", "0"))
+    ),
+    # Link bandwidths (GB/s) handed to DeepEP v2's SM estimator. Its auto-probe
+    # reads rdma_gbs from an IB NIC, which is 0 on an MNNVL machine where the
+    # scale-out ranks ride NVLink, and the estimator then divides by zero.
+    # 0 keeps DeepEP's own probing.
+    "VLLM_DEEPEP_V2_RDMA_GBS": lambda: float(os.getenv("VLLM_DEEPEP_V2_RDMA_GBS", "0")),
+    "VLLM_DEEPEP_V2_NVLINK_GBS": lambda: float(
+        os.getenv("VLLM_DEEPEP_V2_NVLINK_GBS", "0")
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput
