@@ -421,21 +421,35 @@ class MlbRoutingRuntime:
         #              which also handles the one case the others do not: the
         #              first refresh after a checkpointed placement, when the
         #              masters themselves move
-        # MLB_ULTRAEP_MOVER=auto (default) tries symm, then direct. Every
-        # mover leaves a layer whose masters move to generic.
-        self._ultraep_mover = os.environ.get("MLB_ULTRAEP_MOVER", "auto").strip()
+        # MLB_ULTRAEP_MOVER (default direct). `auto` and `symm` try symmetric
+        # memory first, but only after every EP rank has agreed it can (see
+        # _symm_setup): a per-rank try/except around the collective rendezvous
+        # let some ranks fall back while the others waited in it, and the
+        # server deadlocked on its first refresh whenever the EP group spanned
+        # hosts without a multi-node NVLink fabric. Measured on GB200 EP16
+        # (DeepSeek-V3, one allocation, arms back to back) symm is within 1-2%
+        # of direct, so direct is the default and symm an explicit choice.
+        # Every mover leaves a layer whose masters move to generic.
+        self._ultraep_mover = os.environ.get("MLB_ULTRAEP_MOVER", "direct").strip()
         self._ultraep_mover_warned = False
         self._symm_hdl: Any = None
         self._symm_buf: torch.Tensor | None = None
         self._symm_layout: list[tuple[int, int, torch.dtype, tuple[int, ...]]] = []
         self._symm_expert_nbytes = 0
-        # MLB_ULTRAEP_LAGGED_APPLY (default 1): solve on this forward, land the
-        # plan (routing snapshot + weights) on the layer's next forward. Keeps
-        # the plan's device->host copy off the critical path -- no per-layer
-        # GPU sync -- at the price of one step of staleness. 0 restores the
-        # synchronous same-batch apply.
+        # MLB_ULTRAEP_LAGGED_APPLY (default 0): with 1 the plan solved on this
+        # forward lands (routing snapshot + weights) on the layer's next
+        # forward, which keeps the plan's device->host copy off the critical
+        # path -- no per-layer GPU sync -- at the price of one step of
+        # staleness: the first batch of a burst runs on the old placement and
+        # the second on a plan fitted to that first batch. Measured on
+        # DeepSeek-V3 EP16 (same allocation, arms back to back): at interval 8
+        # it changes nothing (GB200 139.0k vs 139.0k tok/s, mean imbalance 1.30
+        # vs 1.29); at interval 1 it buys +3% (HybridEP) to +8% (DeepEP normal)
+        # on GB200 for +0.05 of steady imbalance, and on H20 it buys nothing
+        # and costs the same balance. Off by default; set 1 for interval-1
+        # deployments on GB200-class steps.
         self._ultraep_lagged = (
-            os.environ.get("MLB_ULTRAEP_LAGGED_APPLY", "1").strip() != "0"
+            os.environ.get("MLB_ULTRAEP_LAGGED_APPLY", "0").strip() != "0"
         )
         self._ultraep_pending: dict[int, tuple[Any, ...]] = {}
         self._ultraep_pending_host: dict[int, torch.Tensor] = {}
@@ -1340,15 +1354,56 @@ class MlbRoutingRuntime:
         after that all-gather completes, so set L%2 is never overwritten while
         it is still being read.
 
-        Returns False (and drops to the direct mover) when symmetric memory is
-        unavailable on this build.
+        The decision to use symmetric memory is collective. Each rank first
+        judges locally whether it can take part -- the module imports, and the
+        EP group either sits on one host or runs on Blackwell-class devices
+        (taken as a multi-node NVLink fabric; ``MLB_ULTRAEP_MOVER=symm`` skips
+        that heuristic) -- and the verdicts are combined with an all-reduce
+        (min) over the EP group, so every rank either enters the rendezvous or
+        none does. Without that step a rank whose handle exchange failed fell
+        back to direct while its peers waited in the rendezvous, and the
+        server deadlocked on its first refresh whenever the EP group spanned
+        hosts without such a fabric.
+
+        Returns False (and drops to the direct mover) when the group cannot use
+        symmetric memory.
         """
         if self._symm_hdl is not None:
             return True
+        from vllm.distributed import get_ep_group
+
+        ep = get_ep_group()
+        device = self._ultraep_expert_weights[0][0].device
+        reason = ""
+        try:
+            import torch.distributed._symmetric_memory as symm  # noqa: F401
+        except Exception as exc:  # pragma: no cover - build without symm
+            reason = f"symmetric memory unavailable ({exc})"
+        if not reason and self._ultraep_mover != "symm":
+            import socket
+
+            hosts: list[str | None] = [None] * ep.world_size
+            torch.distributed.all_gather_object(
+                hosts, socket.gethostname(), group=ep.cpu_group
+            )
+            if (
+                len(set(hosts)) > 1
+                and torch.cuda.get_device_properties(device).major < 10
+            ):
+                reason = "EP group spans hosts without a multi-node NVLink fabric"
+        verdict = torch.tensor([0 if reason else 1], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(
+            verdict, op=torch.distributed.ReduceOp.MIN, group=ep.device_group
+        )
+        if int(verdict.item()) == 0:
+            logger.info(
+                "MLB weight sync: %s; using the direct send/recv mover on every rank",
+                reason or "another EP rank cannot use symmetric memory",
+            )
+            self._ultraep_mover = "direct"
+            return False
         try:
             import torch.distributed._symmetric_memory as symm
-
-            from vllm.distributed import get_ep_group
 
             weights0 = self._ultraep_expert_weights[0]
             layout: list[tuple[int, int, torch.dtype, tuple[int, ...]]] = []
@@ -1365,11 +1420,11 @@ class MlbRoutingRuntime:
             buf = symm.empty(
                 (2, n_rep, off), dtype=torch.uint8, device=weights0[0].device
             )
-            hdl = symm.rendezvous(buf, group=get_ep_group().device_group)
+            hdl = symm.rendezvous(buf, group=ep.device_group)
         except Exception as exc:
             logger.warning(
-                "MLB weight sync: symmetric memory unavailable (%s); using the "
-                "direct send/recv mover",
+                "MLB weight sync: symmetric-memory rendezvous failed (%s); using "
+                "the direct send/recv mover",
                 exc,
             )
             self._ultraep_mover = "direct"
