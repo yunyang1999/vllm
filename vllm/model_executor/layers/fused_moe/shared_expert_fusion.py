@@ -215,19 +215,26 @@ def maybe_build_shared_expert_fusion(
 
 
 def _l2_pipeline_needs_dispatched_shared_expert() -> bool:
-    """Whether the configured MLB L2 pipeline picks the shared expert's rank."""
-    from vllm.distributed.eplb.mlb_runtime import mlb_l2_algorithm
+    """Whether the configured connector's routing picks the shared expert's
+    rank. Answered from the current vLLM config, which is set while the model
+    is built; without one there is no connector and the answer is no."""
+    try:
+        from vllm.config import get_current_vllm_config
 
-    algorithm = mlb_l2_algorithm()
-    if not algorithm:
+        eplb_config = get_current_vllm_config().parallel_config.eplb_config
+    except Exception:  # noqa: BLE001 - no config context
+        return False
+    if not eplb_config.connector or not eplb_config.l2_algorithm:
         return False
     try:
-        from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+        from vllm.distributed.eplb.connector.factory import EplbConnectorFactory
 
-        caps = RoutingPipeline.from_value(algorithm).capabilities
-    except Exception:
+        caps = EplbConnectorFactory.get_connector_class(
+            eplb_config
+        ).routing_capabilities(eplb_config)
+    except Exception:  # noqa: BLE001 - an unloadable connector fails later, loudly
         return False
-    return bool(getattr(caps, "routes_shared_expert", False))
+    return bool(caps is not None and caps.routes_shared_expert)
 
 
 def shared_expert_fusion_enabled() -> bool:
@@ -251,8 +258,8 @@ def shared_expert_fusion_enabled() -> bool:
         return True
     if _l2_pipeline_needs_dispatched_shared_expert():
         logger.warning_once(
-            "Enabling shared-expert fusion: the configured MLB L2 pipeline "
-            "(VLLM_MLB_L2_ALGORITHM) assigns the shared expert to a rank, "
+            "Enabling shared-expert fusion: the configured EPLB connector's "
+            "routing (eplb_config.l2_algorithm) assigns the shared expert to a rank, "
             "which requires it to go through expert-parallel dispatch. Set "
             "VLLM_FUSE_SHARED_EXPERTS=1 to make this explicit, or drop "
             "waterfill from the pipeline to keep the shared expert "

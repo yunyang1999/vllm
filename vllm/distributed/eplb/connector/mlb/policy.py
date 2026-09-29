@@ -9,7 +9,9 @@ translates :class:`AbstractEplbPolicy` arguments into an MLB
 ``PlacementRequest``, runs the selected MLB policy, and translates the result
 back into the ``physical_to_logical_map`` vLLM expects.
 
-Enable with ``--eplb-config '{"policy": "mlb", "use_async": false}'``.
+Enable with ``--eplb-config '{"policy": "mlb", "use_async": false}'`` (an
+alias for ``connector: "mlb"``; the connector supplies this class through
+:meth:`MoeLoadBalancerConnector.placement_policy`).
 The MLB placement algorithm is selected with ``VLLM_MLB_L1_ALGORITHM``
 (default ``auto``); see ``moe_load_balancer`` for the supported names.
 
@@ -67,7 +69,7 @@ class MlbEplbPolicy(AbstractEplbPolicy):
         ep_rank: int | None = None,
     ) -> torch.Tensor:
         try:
-            from vllm.distributed.eplb.mlb_runtime import (
+            from vllm.distributed.eplb.connector.mlb.runtime import (
                 placement_request,
                 plan_placement,
             )

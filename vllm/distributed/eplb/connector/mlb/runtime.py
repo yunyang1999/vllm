@@ -10,9 +10,10 @@ solved for, and the kernel samples from them instead of hashing.  Recording,
 the record gate and the padding mask therefore stay where vLLM put them, with
 nothing reimplemented alongside.
 
-Enable with ``VLLM_MLB_L2_ALGORITHM``, e.g. ``lplb``, ``dynamic``, ``static``.
-Unset (the default) leaves vLLM's fused kernel in charge, so this module costs
-nothing when it is not used.
+Selected through the ``mlb`` EPLB connector (``--eplb-config`` ``policy: "mlb"``
+or ``connector: "mlb"``) with an L2 expression such as ``lplb``, ``static`` or
+``ultraep+waterfill`` in ``l2_algorithm`` (default ``$VLLM_MLB_L2_ALGORITHM``).
+Without a connector vLLM's fused kernel stays in charge and nothing here runs.
 
 Two things are deliberately *not* supported and fail loudly rather than
 silently degrading:
@@ -34,21 +35,13 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.distributed.eplb.connector.base import EplbRoutingRuntimeBase
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.distributed.eplb.eplb_state import EplbLayerState
 
 logger = init_logger(__name__)
-
-ALGORITHM_ENV = "VLLM_MLB_L2_ALGORITHM"
-
-_runtime: MlbRoutingRuntime | None = None
-
-
-def mlb_l2_algorithm() -> str:
-    """Configured MLB routing expression, or "" when MLB routing is off."""
-    return envs.VLLM_MLB_L2_ALGORITHM
 
 
 class VllmRoutingCollectives:
@@ -180,7 +173,7 @@ def _dp_token_counts() -> torch.Tensor | None:
     return getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
 
 
-class MlbRoutingRuntime:
+class MlbRoutingRuntime(EplbRoutingRuntimeBase):
     """Holds the MoELoadBalancer instance and the placement geometry."""
 
     def __init__(
@@ -1700,82 +1693,6 @@ class MlbRoutingRuntime:
         return None
 
 
-class VllmMlbIntegration:
-    """One balancer per engine, serving both placement and routing.
-
-    SGLang gives an engine a single MoELoadBalancer and lets L1 and L2 share
-    it. vLLM did not: the L1 policy built a throwaway instance on every
-    rebalance and L2 held a second one in a module global. Two instances cannot
-    see each other's state, which rules out any policy whose placement decision
-    depends on what routing observed -- the premise of the predictive layer --
-    and a module global also rules out more than one engine in a process.
-
-    The lookup below stays module-level because vLLM's placement policy is a
-    classmethod with nowhere to hang an instance. Ownership is not: the
-    integration is created and released by EplbState, so its lifetime is the
-    engine's.
-    """
-
-    def __init__(self, algorithm: str = "") -> None:
-        from moe_load_balancer import MoELoadBalancer
-
-        self.algorithm = algorithm
-        self._balancer_kwargs: dict | None = None
-        self._balancer = None if algorithm else MoELoadBalancer()
-        self.routing: MlbRoutingRuntime | None = None
-
-    def balancer(self):
-        """The single MoELoadBalancer this engine uses."""
-        if self._balancer is None:
-            from moe_load_balancer import MoELoadBalancer
-
-            if self._balancer_kwargs is None:
-                # Placement can be asked for before the routing geometry is
-                # known; a plain planner answers L1 and is replaced in place
-                # once routing supplies the topology.
-                self._balancer = MoELoadBalancer()
-            else:
-                self._balancer = MoELoadBalancer.from_algorithm(
-                    self.algorithm, **self._balancer_kwargs
-                )
-        return self._balancer
-
-    def bind_routing(self, **kwargs) -> MlbRoutingRuntime:
-        """Create the routing runtime against this engine's balancer."""
-        from moe_load_balancer import MoELoadBalancer
-
-        self._balancer_kwargs = {
-            "ep_size": kwargs["ep_size"],
-            "source_rank": kwargs["ep_rank"],
-            "experts_per_rank": kwargs["num_physical_experts"] // kwargs["ep_size"],
-            "collectives": VllmRoutingCollectives(),
-        }
-        self._balancer = MoELoadBalancer.from_algorithm(
-            self.algorithm, **self._balancer_kwargs
-        )
-        self.routing = MlbRoutingRuntime(
-            self.algorithm, balancer=self._balancer, **kwargs
-        )
-        return self.routing
-
-
-_integration: VllmMlbIntegration | None = None
-
-
-def get_mlb_integration() -> VllmMlbIntegration:
-    """The engine's integration, created on first use."""
-    global _integration
-    if _integration is None:
-        _integration = VllmMlbIntegration(mlb_l2_algorithm())
-    return _integration
-
-
-def set_mlb_integration(integration: VllmMlbIntegration | None) -> None:
-    global _integration, _runtime
-    _integration = integration
-    _runtime = None if integration is None else integration.routing
-
-
 def l2_pipeline_capabilities(algorithm: str):
     """Capabilities the named L2 pipeline declares, or None if unknown.
 
@@ -1793,7 +1710,11 @@ def l2_pipeline_capabilities(algorithm: str):
         return None
 
 
-def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | None:
+def l2_inapplicable_reason(
+    algorithm: str,
+    num_redundant_experts: int,
+    routes_shared_expert: bool | None = None,
+) -> str | None:
     """Why the named policy cannot act on this deployment, or None.
 
     The reason is the policy's own words. What this side supplies is what only
@@ -1819,62 +1740,33 @@ def l2_inapplicable_reason(algorithm: str, num_redundant_experts: int) -> str | 
         pipeline = RoutingPipeline.from_value(algorithm)
     except Exception:
         return None
-    from vllm.model_executor.layers.fused_moe.shared_expert_fusion import (
-        shared_expert_fusion_enabled,
-    )
+    if routes_shared_expert is None:
+        from vllm.model_executor.layers.fused_moe.shared_expert_fusion import (
+            shared_expert_fusion_enabled,
+        )
+
+        routes_shared_expert = shared_expert_fusion_enabled()
 
     return pipeline.is_applicable(
         ExpertDeploymentConfig(
             num_redundant_experts=num_redundant_experts,
-            routes_shared_expert=shared_expert_fusion_enabled(),
+            routes_shared_expert=routes_shared_expert,
             carries_placement_metadata=True,
         )
     )
 
 
 def plan_placement(request):
-    """Run L1 through the engine's balancer and hand back vLLM's one map."""
-    from moe_load_balancer.adapters.vllm import to_vllm_physical_to_logical
+    """Run L1 through the engine's connector and hand back vLLM's one map.
 
-    integration = get_mlb_integration()
-    plan = integration.balancer().plan_placement(request)
-    # UltraEP is the only L1 policy that publishes this; every other plan's
-    # metadata simply lacks the key, so this stays a no-op for them. Routing
-    # geometry can lag placement (see balancer()'s docstring), so there may be
-    # no runtime to hand the quota to yet -- it reads whatever the next solve
-    # after bind_routing() leaves here.
-    #
-    # The candidate table and replica counts come along too, not just the
-    # quota: they must be read from this same plan, not rebuilt from
-    # phy2log through vLLM's own compute_logical_maps, or the quota's column
-    # ordering and width silently stop matching the table L2 routes against.
-    #
-    # Stashed here rather than after the caller commits the weight move: no
-    # forward can observe this quota paired with the placement it belongs to
-    # before that commit happens, because MlbEplbPolicy requires synchronous
-    # (use_async=False) rearrangement -- nothing else runs on this thread
-    # between this return and register_logical_maps(). An async L1 path would
-    # need this to move to the commit step instead.
-    quota = plan.metadata.get("rank_quota_prefix")
-    if quota is not None and integration.routing is not None:
-        integration.routing._ultraep_rank_quota_prefix = quota
-        integration.routing._ultraep_logical_to_physical = (
-            plan.logical_to_all_physical_map
-        )
-        integration.routing._ultraep_replica_counts = plan.logical_to_physical_count
-        # All three come from the same plan whose physical_to_logical_map the
-        # caller commits next, so every layer's tables are consistent with the
-        # placement as of this moment. Say so: `_snapshot` routes a layer
-        # against MLB's tables only once it appears here, and leaving the set
-        # empty left this solve's routing unused until something else added the
-        # layer. Nothing was observably wrong -- RefreshGate refreshes on a
-        # layer's first call whatever the interval, so every layer was added on
-        # its first forward -- but the invariant was being maintained by a
-        # second component's incidental behaviour rather than by the code that
-        # knows the tables are ready. Stating it here is what makes the gate's
-        # meaning ("routable") match the condition it tests.
-        integration.routing._ultraep_committed_layers = set(range(quota.shape[0]))
-    return to_vllm_physical_to_logical(plan), plan
+    The connector owns the balancer that L2 routes with, so L1 and L2 see one
+    instance; see :meth:`MoeLoadBalancerConnector.plan_placement`.
+    """
+    from vllm.distributed.eplb.connector.mlb.connector import (
+        current_mlb_connector,
+    )
+
+    return current_mlb_connector().plan_placement(request)
 
 
 def placement_request(*args, **kwargs):
@@ -1924,70 +1816,3 @@ def _reject_graphs_with_rearranging_placement_state(rearranges: bool) -> None:
         "not re-plan), or set enforce_eager=True. Fixing this properly needs "
         "a fixed-shape solver state in moe_load_balancer."
     )
-
-
-def init_mlb_routing(
-    *,
-    algorithm: str,
-    ep_size: int,
-    ep_rank: int,
-    num_logical_experts: int,
-    num_physical_experts: int,
-    physical_to_logical_map: torch.Tensor,
-    logical_to_physical_map: torch.Tensor,
-    logical_replica_count: torch.Tensor,
-    rearranges: bool = False,
-    expert_weights: Any | None = None,
-    expert_buffer: Any | None = None,
-    communicator: Any | None = None,
-) -> MlbRoutingRuntime | None:
-    """Create the routing runtime for a configured L2 algorithm.
-
-    ``algorithm`` comes from ``EPLBConfig.l2_algorithm``, which has already
-    resolved the environment default and cleared itself for placements no L2
-    policy can act on. Passing it in rather than re-reading the environment is
-    what makes that decision binding.
-
-    ``expert_weights`` is the model's own ``expert_weights`` (one entry per
-    MoE layer, present at this same call site); ``expert_buffer`` and
-    ``communicator`` are ``EplbState``'s own staging buffer and P2P backend
-    for moving expert weight between ranks. Only ``ultraep`` reads them -- it
-    is the one policy that re-plans placement often enough to need weight
-    moved mid-run rather than at the rearrangement cadence -- and it moves it
-    with this framework machinery rather than any of its own. Every other
-    algorithm ignores all three, so they are safe to leave unset.
-    """
-    global _runtime
-    if not algorithm:
-        return None
-    integration = get_mlb_integration()
-    integration.algorithm = algorithm
-    _runtime = integration.bind_routing(
-        ep_size=ep_size,
-        ep_rank=ep_rank,
-        num_logical_experts=num_logical_experts,
-        num_physical_experts=num_physical_experts,
-        physical_to_logical_map=physical_to_logical_map,
-        expert_weights=expert_weights,
-        expert_buffer=expert_buffer,
-        communicator=communicator,
-    )
-    _runtime.register_logical_maps(logical_to_physical_map, logical_replica_count)
-    # Keyed on the declared stability of the policy's state, not on whether it
-    # keeps state at all. A policy whose placement-derived tensors keep their
-    # addresses across a rearrangement is safe to capture; refusing it because
-    # some other policy is not would bar a combination that never faults.
-    if _runtime.graph_stability == "realloc_on_placement_change":
-        _reject_graphs_with_rearranging_placement_state(rearranges)
-    return _runtime
-
-
-def get_mlb_routing() -> MlbRoutingRuntime | None:
-    return _runtime
-
-
-def reset_mlb_routing() -> None:
-    """Test hook. Releases the engine's integration along with the runtime."""
-    global _runtime, _integration
-    _runtime = None
-    _integration = None

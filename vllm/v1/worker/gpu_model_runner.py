@@ -6150,9 +6150,9 @@ class GPUModelRunner(
             # so issuing it would be the asymmetric call, not the missing
             # one.
             if not skip_eplb and self.eplb_state is not None:
-                from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+                from vllm.distributed.eplb.connector.state import get_eplb_routing
 
-                routing = get_mlb_routing()
+                routing = get_eplb_routing()
                 if routing is not None:
                     # Not finalize_step_counts: that publishes the counts and
                     # clears the local buffer, so running it here as well as on

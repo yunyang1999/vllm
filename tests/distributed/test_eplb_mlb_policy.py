@@ -16,7 +16,7 @@ from vllm.distributed.eplb.policy import EPLB_POLICIES, DefaultEplbPolicy
 
 pytest.importorskip("moe_load_balancer")
 
-from vllm.distributed.eplb.policy.mlb import MlbEplbPolicy  # noqa: E402
+from vllm.distributed.eplb.connector.mlb.policy import MlbEplbPolicy  # noqa: E402
 
 # DeepSeek-R1 geometry: 58 MoE layers, 256 routed experts, EP=8, 32 redundant.
 NUM_LAYERS = 58
@@ -70,7 +70,13 @@ def _assert_valid_placement(phy2log: torch.Tensor) -> None:
 
 
 def test_mlb_policy_is_registered():
-    assert EPLB_POLICIES["mlb"] is MlbEplbPolicy
+    from vllm.config.parallel import EPLBConfig
+    from vllm.distributed.eplb.connector.mlb import MoeLoadBalancerConnector
+
+    cfg = EPLBConfig(policy="mlb", use_async=False)
+    assert cfg.connector == "mlb"
+    assert MoeLoadBalancerConnector.placement_policy(cfg) is MlbEplbPolicy
+    assert "mlb" not in EPLB_POLICIES
 
 
 def test_mlb_placement_is_valid():
@@ -164,7 +170,7 @@ def test_ep_rank_reaches_the_placement_request(monkeypatch):
     """Ultraep's placement kernel solves once per EP rank and validates the
     value is in range, so the caller's rank must reach the request -- every
     other algorithm ignores it, but the plumbing is shared."""
-    import vllm.distributed.eplb.mlb_runtime as mlb_runtime
+    import vllm.distributed.eplb.connector.mlb.runtime as mlb_runtime
 
     real_placement_request = mlb_runtime.placement_request
     captured = {}

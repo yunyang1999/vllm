@@ -110,6 +110,18 @@ class EPLBConfig:
       on CUDA, falls back to "torch_gloo")
     """
 
+    connector: str | None = None
+    """Load-balancer connector that supplies the placement policy and, with
+    ``l2_algorithm``, per-token replica routing: a registered name (``"mlb"``,
+    the MoE Load Balancer) or, with ``connector_module_path``, a class name in
+    that module. ``policy: "mlb"`` is an alias for ``connector: "mlb"``."""
+
+    connector_module_path: str | None = None
+    """Module that defines ``connector`` when it lives outside the vLLM tree."""
+
+    connector_extra_config: dict[str, Any] = Field(default_factory=dict)
+    """Free-form settings handed to the connector."""
+
     init_placement_path: str | None = None
     """
     Path to a placement checkpoint saved by a previous profiling run.
@@ -148,6 +160,15 @@ class EPLBConfig:
 
         if not self.l2_algorithm:
             self.l2_algorithm = envs.VLLM_MLB_L2_ALGORITHM
+        # ``policy: "mlb"`` predates the connector field and keeps working as
+        # a spelling of "the mlb connector supplies the placement policy".
+        if self.policy == "mlb" and not self.connector:
+            self.connector = "mlb"
+        if self.use_async and self.connector:
+            raise ValueError(
+                "use_async must be False with an EPLB connector: the connector "
+                "plans placement synchronously on the caller's thread."
+            )
 
         return self
 
@@ -613,11 +634,17 @@ class ParallelConfig:
         # from the field defaults carries an algorithm while its redundancy is
         # still zero; gating on enable_eplb keeps such instances quiet, and a
         # run without EPLB has no routing boundary for the policy to sit in.
-        if self.enable_eplb and self.eplb_config.l2_algorithm:
-            from vllm.distributed.eplb.mlb_runtime import l2_inapplicable_reason
+        if (
+            self.enable_eplb
+            and self.eplb_config.connector
+            and self.eplb_config.l2_algorithm
+        ):
+            from vllm.distributed.eplb.connector.factory import EplbConnectorFactory
 
-            reason = l2_inapplicable_reason(
-                self.eplb_config.l2_algorithm,
+            reason = EplbConnectorFactory.get_connector_class(
+                self.eplb_config
+            ).inapplicable_reason(
+                self.eplb_config,
                 self.eplb_config.num_redundant_experts,
             )
             if reason is not None:
@@ -626,7 +653,7 @@ class ParallelConfig:
                 # framework that decides it by assumption will switch off a
                 # policy that had work to do.
                 logger.warning(
-                    "Disabling MoE Load Balancer L2 routing (%r): %s. Routing "
+                    "Disabling EPLB connector routing (%r): %s. Routing "
                     "is unchanged by this -- the policy could only have "
                     "reproduced it -- but the per-layer routing boundary and "
                     "any load collective it needed are now skipped.",

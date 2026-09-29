@@ -500,7 +500,22 @@ class EplbState:
         self.expert_rearrangement_step_interval = eplb_step_interval
 
         policy_type = self.parallel_config.eplb_config.policy
-        self.policy = EPLB_POLICIES[policy_type]
+        connector_policy = None
+        if self.parallel_config.eplb_config.connector:
+            from vllm.distributed.eplb.connector.factory import EplbConnectorFactory
+
+            connector_policy = EplbConnectorFactory.get_connector_class(
+                self.parallel_config.eplb_config
+            ).placement_policy(self.parallel_config.eplb_config)
+        if connector_policy is not None:
+            self.policy = connector_policy
+        elif policy_type in EPLB_POLICIES:
+            self.policy = EPLB_POLICIES[policy_type]
+        else:
+            raise ValueError(
+                f"EPLB policy {policy_type!r} is supplied by a connector; set "
+                "eplb_config.connector."
+            )
         logger.debug("Selected EPLB policy: %s", policy_type)
 
         # num_ubatches is 0 when DBO is disabled.
@@ -558,25 +573,27 @@ class EplbState:
         if pending_init_p2l is not None:
             self._install_initial_placement(model_state, pending_init_p2l)
 
-        # Optional: hand L2 replica choice to the MoE Load Balancer.  A no-op
-        # unless an L2 algorithm is configured, in which case vLLM's fused
-        # mapping kernel is bypassed at the routing boundary.
+        # Optional: hand L2 replica choice to the configured connector.  A
+        # no-op unless a connector and an L2 algorithm are configured, in which
+        # case the connector's answer replaces the fused kernel's hash at the
+        # routing boundary.
         #
         # Read from the config rather than the environment: EPLBConfig resolves
         # $VLLM_MLB_L2_ALGORITHM once and clears it for placements the policy
         # cannot act on, so by here the answer already accounts for redundancy.
-        from vllm.distributed.eplb.mlb_runtime import (
-            init_mlb_routing,
-            l2_pipeline_capabilities,
+        from vllm.distributed.eplb.connector.state import (
+            ensure_eplb_connector_initialized,
         )
 
-        l2_algorithm = self.parallel_config.eplb_config.l2_algorithm
-        if l2_algorithm:
+        eplb_config = self.parallel_config.eplb_config
+        connector = ensure_eplb_connector_initialized(eplb_config)
+        l2_algorithm = eplb_config.l2_algorithm
+        if connector is not None and l2_algorithm:
             if self.parallel_config.num_ubatches > 1:
-                caps = l2_pipeline_capabilities(l2_algorithm)
+                caps = connector.routing_capabilities(eplb_config)
                 if caps is not None and not caps.supports_concurrent_microbatches:
                     raise ValueError(
-                        f"MoE Load Balancer L2 routing {l2_algorithm!r} is "
+                        f"EPLB connector routing {l2_algorithm!r} is "
                         "incompatible with DBO: it keeps one solver state per "
                         "layer, and concurrent micro-batches would clobber each "
                         "other. Disable DBO, or select a policy that declares "
@@ -584,8 +601,7 @@ class EplbState:
                         "eplb_config.l2_algorithm also removes the conflict."
                     )
             ep_group = get_ep_group()
-            routing = init_mlb_routing(
-                algorithm=l2_algorithm,
+            routing = connector.bind_routing(
                 ep_size=ep_group.world_size,
                 ep_rank=ep_group.rank_in_group,
                 num_logical_experts=model.num_logical_experts,
@@ -678,9 +694,9 @@ class EplbState:
         # graph; we all_reduce and move to _lplb_global_count here (outside
         # the graph, one collective for all layers).  This gives LP solve a
         # stable, up-to-date input without any NCCL inside the capture stream.
-        from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+        from vllm.distributed.eplb.connector.state import get_eplb_routing
 
-        routing = get_mlb_routing()
+        routing = get_eplb_routing()
         if routing is not None:
             # Deliver any placement changes the async worker committed since the
             # last forward, on this thread, before anything routes against them.
@@ -1199,9 +1215,11 @@ class EplbState:
                         # Weights have moved and the live maps are updated, so
                         # a pluggable routing policy may now rebuild any
                         # placement-derived state.
-                        from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+                        from vllm.distributed.eplb.connector.state import (
+                            get_eplb_routing,
+                        )
 
-                        routing = get_mlb_routing()
+                        routing = get_eplb_routing()
                         if routing is not None:
                             routing.on_placement_committed(changed_layer_ids)
 
@@ -1502,7 +1520,7 @@ class EplbLayerState:
     Index of this layer among the model's MoE layers.
 
     The built-in mapping kernel is stateless and does not need it, but a
-    pluggable routing policy (see ``mlb_runtime``) keys its per-layer state by
+    pluggable routing policy (see ``eplb.connector``) keys its per-layer state by
     it.  Recording it here is free: ``set_layer_state`` already receives it.
 
     Note that the layer state deliberately does *not* carry

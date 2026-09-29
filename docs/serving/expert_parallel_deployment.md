@@ -154,8 +154,11 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 | `log_balancedness` | Log balancedness metrics (avg tokens per expert ÷ max tokens per expert) | `false` |
 | `num_redundant_experts` | Additional global experts per EP rank beyond equal distribution | `0` |
 | `use_async` | Use non-blocking EPLB for reduced latency overhead | `true` |
-| `policy` | The policy type for expert parallel load balancing: `"default"` (built-in) or `"mlb"` (MoE Load Balancer, see below) | `"default"` |
-| `l2_algorithm` | MoE Load Balancer replica-routing expression (only with `policy: "mlb"`); empty keeps vLLM's built-in replica choice | `""` |
+| `policy` | The placement policy: `"default"` (built-in) or `"mlb"` (alias for `connector: "mlb"`, see below) | `"default"` |
+| `connector` | A load-balancer connector that supplies the placement policy and, with `l2_algorithm`, per-token replica routing: a registered name (`"mlb"`) or, with `connector_module_path`, a class name in that module | `null` |
+| `connector_module_path` | Module defining `connector` when it lives outside the vLLM tree | `null` |
+| `connector_extra_config` | Free-form settings handed to the connector | `{}` |
+| `l2_algorithm` | The connector's replica-routing expression; empty keeps vLLM's built-in replica choice | `""` |
 | `init_placement_path` | Load a saved expert placement at start-up instead of the trivial layout | `null` |
 | `save_placement_path` | Save the expert placement to this path after every rearrangement | `null` |
 | `communicator` | Backend for expert weight transfers: `"torch_nccl"`, `"torch_gloo"`, `"pynccl"`, `"nixl"`,  or `null` (auto) | `null` |
@@ -179,12 +182,25 @@ vllm serve Qwen/Qwen3-30B-A3B \
             --eplb-config.log_balancedness true
     ```
 
-### MoE Load Balancer policy
+### Load-balancer connectors
 
-`policy: "mlb"` delegates expert placement, and optionally per-token replica routing, to the
+An EPLB *connector* plugs an external load balancer into EPLB at three points, without the
+balancer's code living in vLLM: the placement policy run at a rearrangement (L1), per-token replica
+routing and the shared expert's rank decided per forward through the existing fused map-and-record
+kernel (L2), and one engine-scoped object that `EplbState` binds to its maps, expert weights,
+staging buffer and communicator. The interface is `vllm.distributed.eplb.connector.EplbConnectorBase`
+(configuration-time classmethods `placement_policy`, `routing_capabilities`, `inapplicable_reason`;
+`bind_routing` returning an `EplbRoutingRuntimeBase` whose hooks the router, state and model runner
+call). Built-in connectors are registered by name in `EplbConnectorFactory`; a connector maintained
+outside the tree is selected with `connector_module_path` plus its class name in `connector`.
+
+### MoE Load Balancer connector
+
+`connector: "mlb"` (or the older spelling `policy: "mlb"`) delegates expert placement, and
+optionally per-token replica routing, to the
 [MoE Load Balancer](https://github.com/xutizhou/moe_load_balancer) (`moe_load_balancer`), a
 framework-neutral library of expert-parallel load-balancing policies. vLLM imports it lazily, so
-nothing changes unless the policy is selected; install it into the serving environment first.
+nothing changes unless the connector is selected; install it into the serving environment first.
 
 Two stages are configurable:
 
@@ -192,7 +208,7 @@ Two stages are configurable:
   decided at every rearrangement. `auto` (default) selects the balancer's default algorithm for the
   model's expert-group layout; `ultraep` re-solves placement and per-replica quotas online every
   `MLB_ULTRAEP_REFRESH_INTERVAL` representative batches and moves the affected expert weights itself.
-- **L2, replica routing** (`--eplb-config.l2_algorithm` or `VLLM_MLB_L2_ALGORITHM`): which replica
+- **L2, replica routing** (`--eplb-config.l2_algorithm`, default `VLLM_MLB_L2_ALGORITHM`): which replica
   of a logical expert serves each token. Expressions combine a routed-expert policy (`static`,
   `lplb`, `ultraep`) with an optional shared-expert policy (`+waterfill`), e.g. `lplb+waterfill`.
   `waterfill` dispatches the shared expert through the expert-parallel all-to-all so that it can be
@@ -209,7 +225,7 @@ vllm serve deepseek-ai/DeepSeek-V3 \
     --eplb-config '{"policy":"mlb","use_async":false,"num_redundant_experts":16,"l2_algorithm":"ultraep+waterfill","log_balancedness":true}'
 ```
 
-`use_async` must be `false` with this policy: the balancer plans synchronously on the caller's
+`use_async` must be `false` with a connector: the balancer plans synchronously on the caller's
 thread. To fit a placement once and serve with it held, run a short profiling serve with
 `"save_placement_path": "/path/placement.pt"` and start production with
 `"init_placement_path": "/path/placement.pt"` and a `step_interval` that is never reached.

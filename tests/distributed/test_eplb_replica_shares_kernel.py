@@ -169,7 +169,7 @@ def test_matching_the_collective_does_not_publish_zero_counts():
     """
     import torch
 
-    from vllm.distributed.eplb.mlb_runtime import MlbRoutingRuntime
+    from vllm.distributed.eplb.connector.mlb.runtime import MlbRoutingRuntime
 
     rt = MlbRoutingRuntime.__new__(MlbRoutingRuntime)
     rt._logical_count_local = torch.zeros(2, 8)

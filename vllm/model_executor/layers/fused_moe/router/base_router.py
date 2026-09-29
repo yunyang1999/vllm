@@ -240,9 +240,9 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         replica_prob = None
         physical_ids = None
         if layer_state is not None and topk_weights is not None:
-            from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+            from vllm.distributed.eplb.connector.state import get_eplb_routing
 
-            routing = get_mlb_routing()
+            routing = get_eplb_routing()
             # A policy that decides from the committed placement alone has
             # nothing to add per forward: its answer was already materialised
             # into a one-column candidate map when the placement committed, so
@@ -486,9 +486,9 @@ class BaseRouter(FusedMoERouter):
             eplb_state is not None
             and eplb_state.num_unpadded_tokens_tensors is not None
         ):
-            from vllm.distributed.eplb.mlb_runtime import get_mlb_routing
+            from vllm.distributed.eplb.connector.state import get_eplb_routing
 
-            routing = get_mlb_routing()
+            routing = get_eplb_routing()
             if routing is not None and routing.routes_shared_expert:
                 shared_rank = routing.resolve_shared_expert_rank(
                     topk_ids,

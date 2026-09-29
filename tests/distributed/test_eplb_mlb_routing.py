@@ -17,13 +17,15 @@ import torch
 
 pytest.importorskip("moe_load_balancer")
 
+from vllm.distributed.eplb.connector.mlb.runtime import (  # noqa: E402
+    MlbRoutingRuntime,
+)
+from vllm.distributed.eplb.connector.state import (  # noqa: E402
+    reset_eplb_connector,
+)
 from vllm.distributed.eplb.eplb_state import (  # noqa: E402
     EplbLayerState,
     compute_logical_maps,
-)
-from vllm.distributed.eplb.mlb_runtime import (  # noqa: E402
-    MlbRoutingRuntime,
-    reset_mlb_routing,
 )
 
 NUM_LAYERS = 4
@@ -37,7 +39,7 @@ TOPK = 4
 @pytest.fixture(autouse=True)
 def _reset():
     yield
-    reset_mlb_routing()
+    reset_eplb_connector()
 
 
 def _placement() -> torch.Tensor:
@@ -135,7 +137,7 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
     reference should_refresh gates the same way, rejecting only its provable
     "decode" stage). A decode batch must return before touching the refresh
     gate's counter or moving any weight."""
-    import vllm.distributed.eplb.mlb_runtime as mlb_runtime
+    import vllm.distributed.eplb.connector.mlb.runtime as mlb_runtime
 
     num_local_physical = NUM_PHYSICAL // EP_SIZE
     expert_weights = [
@@ -175,7 +177,7 @@ def test_current_stage_under_dp_ignores_this_ranks_own_decode_shape(monkeypatch)
     Answering "decode" off this rank's own descriptor is what splits the group,
     so the DP-reduced flag wins and a locally-decode-shaped batch still reports
     "mixed" when its peers are not decoding."""
-    import vllm.distributed.eplb.mlb_runtime as mlb_runtime
+    import vllm.distributed.eplb.connector.mlb.runtime as mlb_runtime
     from vllm.forward_context import BatchDescriptor
 
     class _Ctx:
@@ -211,7 +213,7 @@ def test_dp_token_counts_reads_the_tensor_that_actually_exists():
     its single-rank fallback everywhere, i.e. produced precisely the per-rank
     disagreement it exists to prevent, while looking like a working fix. The
     assertion that matters here is simply that it is not None."""
-    from vllm.distributed.eplb.mlb_runtime import _dp_token_counts
+    from vllm.distributed.eplb.connector.mlb.runtime import _dp_token_counts
     from vllm.forward_context import DPMetadata
 
     counts = torch.tensor([4096, 0, 0, 0], dtype=torch.int32)
@@ -255,7 +257,9 @@ def test_ultraep_fast_refresh_arms_for_composed_expressions():
     silently disarmed it, and the failure was not graceful: `_snapshot` still
     saw an allocated quota tensor and routed through placement tables no
     refresh had ever written."""
-    from vllm.distributed.eplb.mlb_runtime import _algorithm_places_with_ultraep
+    from vllm.distributed.eplb.connector.mlb.runtime import (
+        _algorithm_places_with_ultraep,
+    )
 
     assert _algorithm_places_with_ultraep("ultraep")
     assert _algorithm_places_with_ultraep("ultraep+waterfill")
@@ -359,7 +363,7 @@ def test_waterfill_is_rejected_unless_the_shared_expert_is_dispatched(monkeypatc
     property being guarded is the same one: never accept the decision and then
     drop it.
     """
-    from vllm.distributed.eplb.mlb_runtime import l2_inapplicable_reason
+    from vllm.distributed.eplb.connector.mlb.runtime import l2_inapplicable_reason
 
     monkeypatch.setenv("VLLM_FUSE_SHARED_EXPERTS", "0")
     import importlib
@@ -406,7 +410,7 @@ def test_l2_applicability_is_decided_on_the_config_the_run_uses(monkeypatch):
         data_parallel_size=2,
         enable_expert_parallel=True,
         enable_eplb=True,
-        eplb_config=EPLBConfig(l2_algorithm="ultraep"),
+        eplb_config=EPLBConfig(policy="mlb", use_async=False, l2_algorithm="ultraep"),
     )
     assert assembled.eplb_config.l2_algorithm == ""
 
@@ -414,8 +418,19 @@ def test_l2_applicability_is_decided_on_the_config_the_run_uses(monkeypatch):
     # in and is left alone, silently: this is also what a throwaway instance
     # built from the field defaults looks like, and it must not announce a
     # disable that never applied to any run.
-    idle = ParallelConfig(eplb_config=EPLBConfig(l2_algorithm="ultraep"))
+    idle = ParallelConfig(
+        eplb_config=EPLBConfig(policy="mlb", use_async=False, l2_algorithm="ultraep")
+    )
     assert idle.eplb_config.l2_algorithm == "ultraep"
+
+    # Without a connector nobody claims the expression, so it is left alone.
+    unclaimed = ParallelConfig(
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=True,
+        eplb_config=EPLBConfig(l2_algorithm="ultraep"),
+    )
+    assert unclaimed.eplb_config.l2_algorithm == "ultraep"
 
 
 def test_placement_commit_refreshes_policy_state():
@@ -579,7 +594,7 @@ def test_graphs_plus_rearranging_placement_state_is_refused(monkeypatch):
     import sys
     import types
 
-    from vllm.distributed.eplb import mlb_runtime
+    from vllm.distributed.eplb.connector.mlb import runtime as mlb_runtime
 
     class _Mode:
         name = "FULL_AND_PIECEWISE"
@@ -728,32 +743,41 @@ def test_placement_and_routing_share_one_balancer():
     """An engine gets one balancer serving both layers.
 
     Two instances cannot see each other, which rules out any placement decision
-    that depends on what routing observed.
+    that depends on what routing observed. The connector is that instance's
+    owner; ``EplbState`` creates it and binds routing against it.
     """
-    from vllm.distributed.eplb.mlb_runtime import (
-        get_mlb_integration,
-        reset_mlb_routing,
+    from vllm.config.parallel import EPLBConfig
+    from vllm.distributed.eplb.connector.mlb import MoeLoadBalancerConnector
+    from vllm.distributed.eplb.connector.state import (
+        ensure_eplb_connector_initialized,
+        get_eplb_connector,
+        get_eplb_routing,
     )
 
-    reset_mlb_routing()
+    reset_eplb_connector()
     try:
-        integration = get_mlb_integration()
-        integration.algorithm = "lplb"
+        cfg = EPLBConfig(policy="mlb", use_async=False, l2_algorithm="lplb")
+        connector = ensure_eplb_connector_initialized(cfg)
+        assert isinstance(connector, MoeLoadBalancerConnector)
         num_physical = NUM_LOGICAL + 8
         phy2log = torch.stack(
             [torch.arange(num_physical) % NUM_LOGICAL for _ in range(NUM_LAYERS)]
         )
-        routing = integration.bind_routing(
+        log2phy, counts = compute_logical_maps(phy2log, NUM_LOGICAL)
+        routing = connector.bind_routing(
             ep_size=EP_SIZE,
             ep_rank=0,
             num_logical_experts=NUM_LOGICAL,
             num_physical_experts=num_physical,
             physical_to_logical_map=phy2log,
+            logical_to_physical_map=log2phy,
+            logical_replica_count=counts,
         )
-        assert integration.balancer() is routing._mlb
-        assert get_mlb_integration() is integration
+        assert connector.balancer() is routing._mlb
+        assert get_eplb_connector() is connector
+        assert get_eplb_routing() is routing
     finally:
-        reset_mlb_routing()
+        reset_eplb_connector()
 
 
 def test_async_placement_commits_are_delivered_on_the_main_thread():
@@ -834,7 +858,7 @@ def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
     commits, so they are consistent for every layer at that moment; there is
     nothing to wait for.
     """
-    from vllm.distributed.eplb import mlb_runtime
+    from vllm.distributed.eplb.connector.mlb import runtime as mlb_runtime
 
     num_layers, num_logical, max_replicas = 4, NUM_LOGICAL, 3
 
@@ -866,15 +890,19 @@ def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
 
     routing = _Routing()
 
-    class _Integration:
-        def __init__(self):
-            self.routing = routing
+    # A connector with the fake balancer and routing installed, without
+    # importing moe_load_balancer in its constructor.
+    from vllm.distributed.eplb.connector.mlb import connector as connector_module
+    from vllm.distributed.eplb.connector.mlb.connector import (
+        MoeLoadBalancerConnector,
+    )
 
-        def balancer(self):
-            return _Balancer()
-
-    integration = _Integration()
-    monkeypatch.setattr(mlb_runtime, "get_mlb_integration", lambda: integration)
+    connector = MoeLoadBalancerConnector.__new__(MoeLoadBalancerConnector)
+    connector.algorithm = "ultraep"
+    connector._balancer = _Balancer()
+    connector._balancer_kwargs = None
+    connector.routing = routing
+    monkeypatch.setattr(connector_module, "current_mlb_connector", lambda: connector)
     # plan_placement imports this inside the function body, so the name has to
     # be replaced where it is looked up rather than on mlb_runtime itself.
     monkeypatch.setattr(
