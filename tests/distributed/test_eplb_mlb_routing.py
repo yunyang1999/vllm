@@ -262,7 +262,7 @@ def test_ultraep_fast_refresh_arms_for_composed_expressions():
     assert not _algorithm_places_with_ultraep("lplb")
     assert not _algorithm_places_with_ultraep("static")
     assert not _algorithm_places_with_ultraep("waterfill")
-    # Unparseable is not UltraEP's to claim, and must not raise here.
+    # An unparsable expression is not UltraEP's to claim, and must not raise here.
     assert not _algorithm_places_with_ultraep("not-a-policy")
 
 
@@ -399,11 +399,23 @@ def test_l2_applicability_is_decided_on_the_config_the_run_uses(monkeypatch):
     # it alone: its zero redundancy is a default, not a deployment.
     assert EPLBConfig().l2_algorithm == "ultraep"
 
-    # The assembled config decides. Redundancy stays zero here, so ultraep --
-    # which only has replicas to choose between when there are redundant
-    # experts -- is switched off.
-    assembled = ParallelConfig(eplb_config=EPLBConfig(l2_algorithm="ultraep"))
+    # The assembled config of a run that enables EPLB decides. Redundancy
+    # stays zero here, so ultraep -- which only has replicas to choose between
+    # when there are redundant experts -- is switched off.
+    assembled = ParallelConfig(
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=True,
+        eplb_config=EPLBConfig(l2_algorithm="ultraep"),
+    )
     assert assembled.eplb_config.l2_algorithm == ""
+
+    # A config that does not enable EPLB has no routing boundary for L2 to sit
+    # in and is left alone, silently: this is also what a throwaway instance
+    # built from the field defaults looks like, and it must not announce a
+    # disable that never applied to any run.
+    idle = ParallelConfig(eplb_config=EPLBConfig(l2_algorithm="ultraep"))
+    assert idle.eplb_config.l2_algorithm == "ultraep"
 
 
 def test_placement_commit_refreshes_policy_state():
@@ -579,7 +591,7 @@ def test_graphs_plus_rearranging_placement_state_is_refused(monkeypatch):
         compilation_config = _Compilation()
 
     stub = types.ModuleType("vllm.config")
-    stub.get_current_vllm_config = lambda: _Cfg()
+    stub.get_current_vllm_config = lambda: _Cfg()  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "vllm.config", stub)
 
     with pytest.raises(ValueError, match="freed memory|Xid 43"):
@@ -707,9 +719,9 @@ def test_the_runtime_reports_what_the_framework_must_respect():
     # ultraep caches a per-layer state dict on every route_tokens() call, and
     # the quota tensor it caches is a fresh allocation each L1 replan rather
     # than an in-place update -- the same hazard LPLB's solver state has.
-    ue = _sized_runtime("ultraep")
-    assert ue.supports_concurrent_microbatches is False
-    assert ue.graph_stability == "realloc_on_placement_change"
+    ultraep_rt = _sized_runtime("ultraep")
+    assert ultraep_rt.supports_concurrent_microbatches is False
+    assert ultraep_rt.graph_stability == "realloc_on_placement_change"
 
 
 def test_placement_and_routing_share_one_balancer():
@@ -796,7 +808,7 @@ def test_the_nearest_replica_table_is_refreshed_on_every_commit():
     for algorithm, keeps_state in (("static", False), ("lplb", True)):
         rt = _runtime(algorithm)
         assert rt.requires_placement_state is keeps_state
-        calls = []
+        calls: list[int] = []
         rt._rebuild_default_replicas = lambda c=calls: c.append(1)
         rt._commit_layers = lambda ids: None
         rt.on_placement_committed([0])

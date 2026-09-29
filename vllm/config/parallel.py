@@ -147,7 +147,7 @@ class EPLBConfig:
             raise ValueError("log_balancedness_interval must be greater than 0.")
 
         if not self.l2_algorithm:
-            self.l2_algorithm = os.environ.get("VLLM_MLB_L2_ALGORITHM", "").strip()
+            self.l2_algorithm = envs.VLLM_MLB_L2_ALGORITHM
 
         return self
 
@@ -609,12 +609,11 @@ class ParallelConfig:
         #
         # It belongs on this object rather than on EPLBConfig because only this
         # one is certain to be the config the run uses. EPLBConfig defaults
-        # l2_algorithm from the environment, so the throwaway instance that
-        # EngineArgs builds from the field default carries an algorithm while
-        # its redundancy is still zero -- deciding there announced a disable
-        # that never applied to the run, once per engine core, in exactly the
-        # log someone would read to check whether L2 was on.
-        if self.eplb_config.l2_algorithm:
+        # l2_algorithm from the environment, so a throwaway instance built
+        # from the field defaults carries an algorithm while its redundancy is
+        # still zero; gating on enable_eplb keeps such instances quiet, and a
+        # run without EPLB has no routing boundary for the policy to sit in.
+        if self.enable_eplb and self.eplb_config.l2_algorithm:
             from vllm.distributed.eplb.mlb_runtime import l2_inapplicable_reason
 
             reason = l2_inapplicable_reason(

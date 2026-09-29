@@ -30,10 +30,9 @@ in range -- so ``EplbState.rearrange`` passes its own ``ep_rank`` alongside
 
 from __future__ import annotations
 
-import os
-
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.eplb.policy.abstract import AbstractEplbPolicy
 from vllm.distributed.eplb.policy.default import DefaultEplbPolicy
 from vllm.logger import init_logger
@@ -45,7 +44,7 @@ ALGORITHM_ENV = "VLLM_MLB_L1_ALGORITHM"
 
 
 def _algorithm() -> str:
-    return os.environ.get(ALGORITHM_ENV, DEFAULT_ALGORITHM)
+    return envs.VLLM_MLB_L1_ALGORITHM or DEFAULT_ALGORITHM
 
 
 class MlbEplbPolicy(AbstractEplbPolicy):

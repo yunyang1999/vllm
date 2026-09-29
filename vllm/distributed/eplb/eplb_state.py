@@ -1010,6 +1010,9 @@ class EplbState:
         # afterwards instead of re-serving the model once per arm.
         _dump = envs.VLLM_EPLB_DUMP_LOAD_PATH
         if _dump and not is_profile and ep_group.rank() == 0:
+            # Numbered per rearrangement: the step counter has already been
+            # reset when this runs, so it cannot tell two dumps apart.
+            self._dump_seq = getattr(self, "_dump_seq", 0) + 1
             _st = next(iter(self.model_states.values()))
             torch.save(
                 {
@@ -1020,14 +1023,14 @@ class EplbState:
                     "num_moe_layers": _st.model.num_moe_layers,
                     "num_expert_groups": _st.model.num_expert_groups,
                     "ep_size": ep_group.size(),
-                    "step": int(self.expert_rearrangement_step),
+                    "rearrangement": self._dump_seq,
                 },
-                f"{_dump}.step{int(self.expert_rearrangement_step)}.pt",
+                f"{_dump}.rearr{self._dump_seq:03d}.pt",
             )
             logger.info(
-                "EPLB: dumped logical expert load to %s.step%d.pt",
+                "EPLB: dumped logical expert load to %s.rearr%03d.pt",
                 _dump,
-                int(self.expert_rearrangement_step),
+                self._dump_seq,
             )
 
         # TODO(bowen): Treat differently for prefill and decode nodes

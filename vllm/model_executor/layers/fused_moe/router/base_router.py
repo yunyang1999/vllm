@@ -229,7 +229,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
         *,
-        layer_state: object | None = None,
+        layer_state: EplbLayerState | None = None,
         topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # A pluggable load balancer decides how each logical expert's traffic
@@ -288,7 +288,7 @@ else:
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
         *,
-        layer_state: object | None = None,
+        layer_state: EplbLayerState | None = None,
         topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return topk_ids

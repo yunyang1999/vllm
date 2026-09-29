@@ -251,7 +251,8 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
             num_qps_per_rank=num_qps_per_rank,
             explicitly_destroy=True,
         )
-        # On a multi-node NVLink domain (GB200 NVL72) an EP group spans trays,
+        # On a multi-node NVLink domain (e.g. Blackwell multi-node NVLink
+        # systems) an EP group spans trays,
         # and the buffer's default IPC path is node-local: it dies at startup
         # with cudaErrorInvalidResourceHandle. deep_ep 2.0 selects the fabric
         # path through allow_mnnvl. Opt-in.

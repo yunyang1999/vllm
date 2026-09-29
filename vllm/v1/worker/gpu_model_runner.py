@@ -3935,6 +3935,7 @@ class GPUModelRunner(
         bool,
         torch.Tensor | None,
         CUDAGraphStat | None,
+        bool,
     ]:
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,

@@ -27,13 +27,13 @@ silently degrading:
 
 from __future__ import annotations
 
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ _runtime: MlbRoutingRuntime | None = None
 
 def mlb_l2_algorithm() -> str:
     """Configured MLB routing expression, or "" when MLB routing is off."""
-    return os.environ.get(ALGORITHM_ENV, "").strip()
+    return envs.VLLM_MLB_L2_ALGORITHM
 
 
 class VllmRoutingCollectives:
@@ -83,7 +83,7 @@ def _algorithm_places_with_ultraep(algorithm: str) -> bool:
     the question the fast-refresh path needs answered: it owns the placement
     solve and the weight movement that follows it, and it must run for every
     expression UltraEP places for -- ``ultraep`` and ``ultraep+waterfill``
-    alike. An unparseable expression is not UltraEP's to claim; the caller
+    alike. An unparsable expression is not UltraEP's to claim; the caller
     reports that separately.
     """
     from moe_load_balancer.core.routing_pipeline import RoutingPipeline
@@ -192,7 +192,7 @@ class MlbRoutingRuntime:
         num_logical_experts: int,
         num_physical_experts: int,
         physical_to_logical_map: torch.Tensor,
-        balancer: object | None = None,
+        balancer: Any | None = None,
         expert_weights: Any | None = None,
         expert_buffer: Any | None = None,
         communicator: Any | None = None,
@@ -233,7 +233,7 @@ class MlbRoutingRuntime:
         # Injected when an engine-scoped integration owns the balancer, so L1
         # and L2 are served by one instance rather than two that cannot see
         # each other.
-        self._mlb = (
+        self._mlb: Any = (
             balancer
             if balancer is not None
             else MoELoadBalancer.from_algorithm(
@@ -341,7 +341,7 @@ class MlbRoutingRuntime:
         # MLB_KEEP_ZERO_REDUNDANCY_COUNTS=1 restores the ungated behaviour so the
         # cost of that discarded work can be measured against this, rather than
         # only argued for.
-        keep_degenerate = os.environ.get("MLB_KEEP_ZERO_REDUNDANCY_COUNTS") == "1"
+        keep_degenerate = envs.MLB_KEEP_ZERO_REDUNDANCY_COUNTS
         if self.consumes_global_logical_count and (
             self._max_replicas > 1 or keep_degenerate
         ):
@@ -369,16 +369,16 @@ class MlbRoutingRuntime:
         # consecutive chunks can differ sharply -- so a measured LPLB regression
         # cannot be attributed to the algorithm without checking this. Read once:
         # replica_shares runs per layer per forward.
-        self._fresh_counts = os.environ.get("MLB_FRESH_COUNTS") == "1"
+        self._fresh_counts = envs.MLB_FRESH_COUNTS
 
         # Diagnostic capture of the LP's inputs and output. Off unless a
         # directory is named; bounded so a long run cannot fill the disk.
-        self._dump_lp_dir = os.environ.get("MLB_DUMP_LP") or None
-        self._dump_lp_left = int(os.environ.get("MLB_DUMP_LP_N", "120"))
+        self._dump_lp_dir = envs.MLB_DUMP_LP
+        self._dump_lp_left = envs.MLB_DUMP_LP_N
         # Skip the opening calls: the first steps legitimately carry zeros
         # while the one-step-stale pipeline fills, and sampling only those
         # would mistake a warm-up transient for steady state.
-        self._dump_lp_skip = int(os.environ.get("MLB_DUMP_LP_SKIP", "0"))
+        self._dump_lp_skip = envs.MLB_DUMP_LP_SKIP
 
         # MLB_TIME_L2=<n> times n route_tokens calls with a device sync on each
         # side. The sync makes the number meaningful and the measurement
@@ -404,11 +404,11 @@ class MlbRoutingRuntime:
         self._ultraep_rank_quota_prefix: torch.Tensor | None = None
         self._ultraep_logical_to_physical: torch.Tensor | None = None
         self._ultraep_replica_counts: torch.Tensor | None = None
-        self._time_l2 = int(os.environ.get("MLB_TIME_L2", "0"))
+        self._time_l2 = envs.MLB_TIME_L2
         # MLB_TIME_REFRESH=<n> times n fast refreshes -- the placement solve and
         # the weight commit separately -- with a device sync on each, then
         # reports and disarms. Same shape as MLB_TIME_L2 above.
-        self._time_refresh = int(os.environ.get("MLB_TIME_REFRESH", "0"))
+        self._time_refresh = envs.MLB_TIME_REFRESH
         # How UltraEP's fast refresh lands re-solved replica weight. Upstream
         # UltraEP does this with a one-sided weight_sync (masters stay put,
         # replica slots are refilled from the owning master); the movers below
@@ -426,11 +426,12 @@ class MlbRoutingRuntime:
         # _symm_setup): a per-rank try/except around the collective rendezvous
         # let some ranks fall back while the others waited in it, and the
         # server deadlocked on its first refresh whenever the EP group spanned
-        # hosts without a multi-node NVLink fabric. Measured on GB200 EP16
-        # (DeepSeek-V3, one allocation, arms back to back) symm is within 1-2%
+        # hosts without a multi-node NVLink fabric. Measured on a Blackwell
+        # multi-node NVLink EP16 deployment (DeepSeek-V3, one allocation, arms
+        # back to back) symm is within 1-2%
         # of direct, so direct is the default and symm an explicit choice.
         # Every mover leaves a layer whose masters move to generic.
-        self._ultraep_mover = os.environ.get("MLB_ULTRAEP_MOVER", "direct").strip()
+        self._ultraep_mover = envs.MLB_ULTRAEP_MOVER
         self._ultraep_mover_warned = False
         self._symm_hdl: Any = None
         self._symm_buf: torch.Tensor | None = None
@@ -443,18 +444,16 @@ class MlbRoutingRuntime:
         # staleness: the first batch of a burst runs on the old placement and
         # the second on a plan fitted to that first batch. Measured on
         # DeepSeek-V3 EP16 (same allocation, arms back to back): at interval 8
-        # it changes nothing (GB200 139.0k vs 139.0k tok/s, mean imbalance 1.30
-        # vs 1.29); at interval 1 it buys +3% (HybridEP) to +8% (DeepEP normal)
-        # on GB200 for +0.05 of steady imbalance, and on H20 it buys nothing
-        # and costs the same balance. Off by default; set 1 for interval-1
-        # deployments on GB200-class steps.
-        self._ultraep_lagged = (
-            os.environ.get("MLB_ULTRAEP_LAGGED_APPLY", "0").strip() != "0"
-        )
+        # it changes nothing (Blackwell, 139.0k vs 139.0k tok/s, mean imbalance
+        # 1.30 vs 1.29); at interval 1 it buys +3% (HybridEP) to +8% (DeepEP
+        # normal) on Blackwell for +0.05 of steady imbalance, and on Hopper it
+        # buys nothing and costs the same balance. Off by default; set 1 for
+        # interval-1 deployments with Blackwell-class step times.
+        self._ultraep_lagged = envs.MLB_ULTRAEP_LAGGED_APPLY
         self._ultraep_pending: dict[int, tuple[Any, ...]] = {}
         self._ultraep_pending_host: dict[int, torch.Tensor] = {}
         self._solve_us: list[float] = []
-        self._commit_us: list[float] = []
+        self._commit_us: list[tuple[int, float]] = []
         self._commit_host_us: list[float] = []
         self._l2_us: list[float] = []
 
@@ -494,9 +493,7 @@ class MlbRoutingRuntime:
         # placement to noise and keeps it there. It bites only where batches
         # are genuinely small: a prefill-shaped step is orders of magnitude
         # above either threshold.
-        self._ultraep_min_representative_tokens = int(
-            os.environ.get("MLB_ULTRAEP_REFRESH_MIN_TOKENS", "512")
-        )
+        self._ultraep_min_representative_tokens = envs.MLB_ULTRAEP_REFRESH_MIN_TOKENS
         # Parsed, not compared as a string. `algorithm` is the whole L2
         # expression, so an equality test here silently misses every
         # composition that merely *contains* ultraep -- `ultraep+waterfill`
@@ -548,7 +545,7 @@ class MlbRoutingRuntime:
         self._ultraep_communicator = communicator
         self._ultraep_num_local_physical = self.num_physical_experts // self.ep_size
 
-        interval = int(os.environ.get("MLB_ULTRAEP_REFRESH_INTERVAL", "64"))
+        interval = envs.MLB_ULTRAEP_REFRESH_INTERVAL
         self._ultraep_refresh_gate = RefreshGate(interval)
         logger.info(
             "UltraEP fast refresh enabled (interval=%d representative "
@@ -647,6 +644,8 @@ class MlbRoutingRuntime:
         # would have made a share-table answer impossible to compile. Every
         # column past `_max_replicas` is padding on both sides, so trimming to
         # it changes no decision.
+        assert layer_state.logical_to_physical_map is not None
+        assert layer_state.logical_replica_count is not None
         candidates = layer_state.logical_to_physical_map[:, : self._max_replicas]
         counts = layer_state.logical_replica_count
         # `requires_rank_dispatch_map` is true only for `static`, and static no
@@ -679,6 +678,8 @@ class MlbRoutingRuntime:
             # candidate table MLB solved them from -- not vLLM's own
             # candidates, independently rebuilt from physical_to_logical_map
             # and not guaranteed to share its width, let alone its ordering.
+            assert self._ultraep_logical_to_physical is not None
+            assert self._ultraep_replica_counts is not None
             candidates = self._ultraep_logical_to_physical[layer_id]
             counts = self._ultraep_replica_counts[layer_id]
         return to_placement_snapshot(
@@ -1061,11 +1062,11 @@ class MlbRoutingRuntime:
             ep_rank=self.ep_rank,
         )
         if self._time_refresh:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             _ts = time.perf_counter()
         plan = self._mlb.plan_placement(request)
         if self._time_refresh:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             self._solve_us.append((time.perf_counter() - _ts) * 1e6)
         if self._ultraep_lagged:
             self._ultraep_stage_pending(layer_id, plan)
@@ -1087,6 +1088,9 @@ class MlbRoutingRuntime:
         solved = plan.physical_to_logical_map[0]
         placement_change = torch.stack((live, solved.to(live.dtype))).cpu().numpy()
 
+        assert self._ultraep_logical_to_physical is not None
+        assert self._ultraep_replica_counts is not None
+        assert self._ultraep_rank_quota_prefix is not None
         self.physical_to_logical_map[layer_id].copy_(solved)
         self._ultraep_logical_to_physical[layer_id].copy_(
             plan.logical_to_all_physical_map[0]
@@ -1110,11 +1114,11 @@ class MlbRoutingRuntime:
         if not self._time_refresh:
             self._commit_placement_weights(layer_id, old_np, new_np)
             return
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         _tc = time.perf_counter()
         self._commit_placement_weights(layer_id, old_np, new_np)
         _host = (time.perf_counter() - _tc) * 1e6
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         _dt = (time.perf_counter() - _tc) * 1e6
         self._commit_host_us.append(_host)
         # How much this commit actually had to move: slots whose occupant
@@ -1196,6 +1200,7 @@ class MlbRoutingRuntime:
             move_to_buffer,
         )
 
+        assert self._ultraep_num_local_physical is not None
         metadata = move_to_buffer(
             num_local_experts=self._ultraep_num_local_physical,
             old_indices=old_np,
@@ -1256,6 +1261,9 @@ class MlbRoutingRuntime:
         change = host.numpy()
         old_np = change[0].copy()
         new_np = change[1].copy()
+        assert self._ultraep_logical_to_physical is not None
+        assert self._ultraep_replica_counts is not None
+        assert self._ultraep_rank_quota_prefix is not None
         self.physical_to_logical_map[layer_id].copy_(solved)
         self._ultraep_logical_to_physical[layer_id].copy_(l2p)
         self._ultraep_replica_counts[layer_id].copy_(counts)
@@ -1371,6 +1379,7 @@ class MlbRoutingRuntime:
         if self._symm_hdl is not None:
             return True
         from vllm.distributed import get_ep_group
+        from vllm.platforms import current_platform
 
         ep = get_ep_group()
         device = self._ultraep_expert_weights[0][0].device
@@ -1386,10 +1395,9 @@ class MlbRoutingRuntime:
             torch.distributed.all_gather_object(
                 hosts, socket.gethostname(), group=ep.cpu_group
             )
-            if (
-                len(set(hosts)) > 1
-                and torch.cuda.get_device_properties(device).major < 10
-            ):
+            capability = current_platform.get_device_capability()
+            multi_node_nvlink = capability is not None and capability.major >= 10
+            if len(set(hosts)) > 1 and not multi_node_nvlink:
                 reason = "EP group spans hosts without a multi-node NVLink fabric"
         verdict = torch.tensor([0 if reason else 1], device=device, dtype=torch.int32)
         torch.distributed.all_reduce(
@@ -1413,6 +1421,7 @@ class MlbRoutingRuntime:
                 nbytes = row.numel() * row.element_size()
                 layout.append((off, nbytes, w.dtype, tuple(row.shape)))
                 off += nbytes
+            assert self._ultraep_num_local_physical is not None
             n_rep = (
                 self._ultraep_num_local_physical
                 - self.num_logical_experts // self.ep_size
@@ -1459,6 +1468,7 @@ class MlbRoutingRuntime:
         if changed is None:
             return False
         masters_per_rank = self.num_logical_experts // self.ep_size
+        assert self._ultraep_num_local_physical is not None
         n_rep = self._ultraep_num_local_physical - masters_per_rank
         new_grid = np.asarray(new_np).reshape(
             self.ep_size, self._ultraep_num_local_physical
@@ -1604,7 +1614,7 @@ class MlbRoutingRuntime:
         )
 
         if self._time_l2:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             _t0 = time.perf_counter()
 
         decision = self._mlb.route_tokens(
@@ -1620,7 +1630,7 @@ class MlbRoutingRuntime:
             )
         )
         if self._time_l2:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             self._l2_us.append((time.perf_counter() - _t0) * 1e6)
             if len(self._l2_us) >= self._time_l2:
                 import statistics
@@ -1649,6 +1659,8 @@ class MlbRoutingRuntime:
 
             self._dump_lp_left -= 1
             lp_probability = decision.metadata.get("lp_probability")
+            assert layer_state.logical_to_physical_map is not None
+            assert layer_state.logical_replica_count is not None
             torch.save(
                 {
                     "layer_id": layer_id,
