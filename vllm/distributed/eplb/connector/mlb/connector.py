@@ -80,8 +80,10 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
                 getattr(caps, "requires_rank_dispatch_map", False)
             ),
             routes_shared_expert=bool(getattr(caps, "routes_shared_expert", False)),
+            # Same conservative default as MlbRoutingRuntime: a pipeline that
+            # does not declare the capability is treated as DBO-unsafe.
             supports_concurrent_microbatches=bool(
-                getattr(caps, "supports_concurrent_microbatches", True)
+                getattr(caps, "supports_concurrent_microbatches", False)
             ),
             graph_stability=str(getattr(caps, "graph_stability", "stable")),
         )
