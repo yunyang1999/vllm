@@ -10,7 +10,7 @@ from .default import DefaultEplbPolicy
 EPLB_POLICIES: dict[str, type[AbstractEplbPolicy]] = {"default": DefaultEplbPolicy}
 
 # Every registered policy is a valid EPLBPolicyOption; the remaining option
-# values ("mlb") name policies a connector supplies (see eplb.connector).
+# values ("evenmoe") name policies a connector supplies (see eplb.connector).
 assert set(EPLB_POLICIES.keys()) <= set(get_args(EPLBPolicyOption))
 
 __all__ = [

@@ -37,7 +37,7 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
-EPLBPolicyOption = Literal["default", "mlb"]
+EPLBPolicyOption = Literal["default", "evenmoe"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
     "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl"
@@ -97,7 +97,7 @@ class EPLBConfig:
     l2_algorithm: str = ""
     """EvenMoE routing expression for the L2 stage, which decides
     which *replica* of a logical expert each token goes to. Empty leaves vLLM's
-    built-in choice in place. Defaults to ``$VLLM_MLB_L2_ALGORITHM``."""
+    built-in choice in place. Defaults to ``$VLLM_EVENMOE_L2_ALGORITHM``."""
 
     communicator: EPLBCommunicatorBackend | None = None
     """
@@ -113,9 +113,9 @@ class EPLBConfig:
 
     connector: str | None = None
     """Load-balancer connector that supplies the placement policy and, with
-    ``l2_algorithm``, per-token replica routing: a registered name (``"mlb"``,
+    ``l2_algorithm``, per-token replica routing: a registered name (``"evenmoe"``,
     EvenMoE) or, with ``connector_module_path``, a class name in
-    that module. ``policy: "mlb"`` is an alias for ``connector: "mlb"``."""
+    that module. ``policy: "evenmoe"`` is an alias for ``connector: "evenmoe"``."""
 
     connector_module_path: str | None = None
     """Module that defines ``connector`` when it lives outside the vLLM tree."""
@@ -130,7 +130,7 @@ class EPLBConfig:
     When set, the initial physical_to_logical_map is loaded from this file
     instead of using the trivial (uniform) assignment.  This is the vLLM
     equivalent of SGLang's ``--init-expert-location``: profile once, save the
-    MLB-optimised placement, then start production with that placement pre-loaded
+    EvenMoE-optimised placement, then start production with that placement pre-loaded
     so LPLB has hot experts already replicated.
 
     The file must have been written by ``save_placement_path`` on a model with
@@ -171,11 +171,11 @@ class EPLBConfig:
             raise ValueError("log_balancedness_interval must be greater than 0.")
 
         if not self.l2_algorithm:
-            self.l2_algorithm = envs.VLLM_MLB_L2_ALGORITHM
-        # ``policy: "mlb"`` predates the connector field and keeps working as
-        # a spelling of "the mlb connector supplies the placement policy".
-        if self.policy == "mlb" and not self.connector:
-            self.connector = "mlb"
+            self.l2_algorithm = envs.VLLM_EVENMOE_L2_ALGORITHM
+        # ``policy: "evenmoe"`` predates the connector field and keeps working as
+        # a spelling of "the evenmoe connector supplies the placement policy".
+        if self.policy == "evenmoe" and not self.connector:
+            self.connector = "evenmoe"
         if self.use_async and self.connector:
             raise ValueError(
                 "use_async must be False with an EPLB connector: the connector "

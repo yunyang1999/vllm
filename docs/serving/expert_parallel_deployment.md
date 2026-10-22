@@ -155,8 +155,8 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 | `log_balancedness` | Log balancedness metrics (avg tokens per expert ÷ max tokens per expert) | `false` |
 | `num_redundant_experts` | Additional global experts per EP rank beyond equal distribution | `0` |
 | `use_async` | Use non-blocking EPLB for reduced latency overhead | `true` |
-| `policy` | The placement policy: `"default"` (built-in) or `"mlb"` (alias for `connector: "mlb"`, see below) | `"default"` |
-| `connector` | A load-balancer connector that supplies the placement policy and, with `l2_algorithm`, per-token replica routing: a registered name (`"mlb"`) or, with `connector_module_path`, a class name in that module | `null` |
+| `policy` | The placement policy: `"default"` (built-in) or `"evenmoe"` (alias for `connector: "evenmoe"`, see below) | `"default"` |
+| `connector` | A load-balancer connector that supplies the placement policy and, with `l2_algorithm`, per-token replica routing: a registered name (`"evenmoe"`) or, with `connector_module_path`, a class name in that module | `null` |
 | `connector_module_path` | Module defining `connector` when it lives outside the vLLM tree | `null` |
 | `connector_extra_config` | Free-form settings handed to the connector | `{}` |
 | `l2_algorithm` | The connector's replica-routing expression; empty keeps vLLM's built-in replica choice | `""` |
@@ -197,7 +197,7 @@ outside the tree is selected with `connector_module_path` plus its class name in
 
 ### EvenMoE (MoE Load Balancer) connector
 
-`connector: "mlb"` (or the older spelling `policy: "mlb"`) delegates expert placement, and
+`connector: "evenmoe"` (or the older spelling `policy: "evenmoe"`) delegates expert placement, and
 optionally per-token replica routing, to the
 [EvenMoE](https://github.com/ai-dynamo/evenmoe) (`evenmoe`, formerly the MoE Load Balancer), a
 framework-neutral library of expert-parallel load-balancing policies. vLLM imports it lazily, so
@@ -205,11 +205,11 @@ nothing changes unless the connector is selected; install it into the serving en
 
 Two stages are configurable:
 
-- **L1, placement** (`VLLM_MLB_L1_ALGORITHM`): which logical expert lives in which physical slot,
+- **L1, placement** (`VLLM_EVENMOE_L1_ALGORITHM`): which logical expert lives in which physical slot,
   decided at every rearrangement. `auto` (default) selects the balancer's default algorithm for the
   model's expert-group layout; `ultraep` re-solves placement and per-replica quotas online every
-  `MLB_ULTRAEP_REFRESH_INTERVAL` representative batches and moves the affected expert weights itself.
-- **L2, replica routing** (`--eplb-config.l2_algorithm`, default `VLLM_MLB_L2_ALGORITHM`): which replica
+  `EVENMOE_ULTRAEP_REFRESH_INTERVAL` representative batches and moves the affected expert weights itself.
+- **L2, replica routing** (`--eplb-config.l2_algorithm`, default `VLLM_EVENMOE_L2_ALGORITHM`): which replica
   of a logical expert serves each token. Expressions combine a routed-expert policy (`static`,
   `lplb`, `ultraep`) with an optional shared-expert policy (`+waterfill`), e.g. `lplb+waterfill`.
   `waterfill` dispatches the shared expert through the expert-parallel all-to-all so that it can be
@@ -219,11 +219,11 @@ Two stages are configurable:
 
 ```bash
 # Placement fitted by the balancer, online UltraEP refresh, Waterfill for the shared expert
-VLLM_MLB_L1_ALGORITHM=ultraep MLB_ULTRAEP_REFRESH_INTERVAL=8 \
+VLLM_EVENMOE_L1_ALGORITHM=ultraep EVENMOE_ULTRAEP_REFRESH_INTERVAL=8 \
 vllm serve deepseek-ai/DeepSeek-V3 \
     --tensor-parallel-size 1 --data-parallel-size 8 --enable-expert-parallel \
     --enable-eplb \
-    --eplb-config '{"policy":"mlb","use_async":false,"num_redundant_experts":16,"l2_algorithm":"ultraep+waterfill","log_balancedness":true}'
+    --eplb-config '{"policy":"evenmoe","use_async":false,"num_redundant_experts":16,"l2_algorithm":"ultraep+waterfill","log_balancedness":true}'
 ```
 
 `use_async` must be `false` with a connector: the balancer plans synchronously on the caller's
@@ -235,10 +235,10 @@ Tuning knobs for the online UltraEP refresh (all read through `vllm.envs`):
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `MLB_ULTRAEP_REFRESH_INTERVAL` | `64` | Re-solve every N representative batches; `8` is a good production value, `1` maximizes balance at the cost of one refresh per step |
-| `MLB_ULTRAEP_REFRESH_MIN_TOKENS` | `512` | A batch counts as representative when it routes at least this many tokens |
-| `MLB_ULTRAEP_MOVER` | `direct` | How re-solved replica weights move between ranks: `direct` (send/recv over the EPLB communicator), `symm` (torch symmetric memory; one host or a multi-node NVLink fabric), `auto` (symm when every rank agrees it can, otherwise direct) |
-| `MLB_ULTRAEP_LAGGED_APPLY` | `0` | `1` lands a plan on the layer's next forward, avoiding a per-layer device sync at the price of one step of staleness; worth about +3% at interval 1 on Blackwell-class step times, nothing at interval 8 |
+| `EVENMOE_ULTRAEP_REFRESH_INTERVAL` | `64` | Re-solve every N representative batches; `8` is a good production value, `1` maximizes balance at the cost of one refresh per step |
+| `EVENMOE_ULTRAEP_REFRESH_MIN_TOKENS` | `512` | A batch counts as representative when it routes at least this many tokens |
+| `EVENMOE_ULTRAEP_MOVER` | `direct` | How re-solved replica weights move between ranks: `direct` (send/recv over the EPLB communicator), `symm` (torch symmetric memory; one host or a multi-node NVLink fabric), `auto` (symm when every rank agrees it can, otherwise direct) |
+| `EVENMOE_ULTRAEP_LAGGED_APPLY` | `0` | `1` lands a plan on the layer's next forward, avoiding a per-layer device sync at the price of one step of staleness; worth about +3% at interval 1 on Blackwell-class step times, nothing at interval 8 |
 
 ### Expert Distribution Formula
 

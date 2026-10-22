@@ -81,5 +81,5 @@ class EplbConnectorFactory:
 
 # Built-in connectors.
 EplbConnectorFactory.register_connector(
-    "mlb", "vllm.distributed.eplb.connector.mlb", "MoeLoadBalancerConnector"
+    "evenmoe", "vllm.distributed.eplb.connector.evenmoe", "EvenMoeConnector"
 )

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The EPLB connector seam itself: registry, module-path loading, engine state
-and the ``policy: "mlb"`` alias. Needs no load balancer installed."""
+and the ``policy: "evenmoe"`` alias. Needs no load balancer installed."""
 
 import pytest
 import torch
@@ -108,12 +108,12 @@ def test_unknown_names_fail_loudly():
         )
 
 
-def test_mlb_policy_is_an_alias_for_the_mlb_connector():
-    cfg = EPLBConfig(policy="mlb", use_async=False)
-    assert cfg.connector == "mlb"
-    assert "mlb" not in EPLB_POLICIES
+def test_evenmoe_policy_is_an_alias_for_the_evenmoe_connector():
+    cfg = EPLBConfig(policy="evenmoe", use_async=False)
+    assert cfg.connector == "evenmoe"
+    assert "evenmoe" not in EPLB_POLICIES
     # An explicit connector is not overridden by the alias.
-    cfg = EPLBConfig(policy="mlb", connector="dummy", use_async=False)
+    cfg = EPLBConfig(policy="evenmoe", connector="dummy", use_async=False)
     assert cfg.connector == "dummy"
 
 

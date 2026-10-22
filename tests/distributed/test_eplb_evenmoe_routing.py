@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for MLB-backed L2 token routing.
+"""Tests for EvenMoE-backed L2 token routing.
 
 Run on a single device without a process group: ``static`` and ``dynamic``
 replica policies make a local decision, so no EP collective is issued.  The
 ``lplb`` policy does issue one and is covered by the multi-rank CUDA-graph
 probe instead.
 
-The important property under test is the accuracy-preserving invariant: MLB
+The important property under test is the accuracy-preserving invariant: EvenMoE
 may only change *which physical replica* serves a token, never which logical
 expert the router chose.
 """
@@ -17,8 +17,8 @@ import torch
 
 pytest.importorskip("evenmoe")
 
-from vllm.distributed.eplb.connector.mlb.runtime import (  # noqa: E402
-    MlbRoutingRuntime,
+from vllm.distributed.eplb.connector.evenmoe.runtime import (  # noqa: E402
+    EvenMoeRoutingRuntime,
 )
 from vllm.distributed.eplb.connector.state import (  # noqa: E402
     reset_eplb_connector,
@@ -51,10 +51,10 @@ def _placement() -> torch.Tensor:
     return torch.tensor(rows, dtype=torch.int64)
 
 
-def _runtime(algorithm: str) -> MlbRoutingRuntime:
+def _runtime(algorithm: str) -> EvenMoeRoutingRuntime:
     phy2log = _placement()
     log2phy, replica_count = compute_logical_maps(phy2log, NUM_LOGICAL)
-    rt = MlbRoutingRuntime(
+    rt = EvenMoeRoutingRuntime(
         algorithm,
         ep_size=EP_SIZE,
         ep_rank=0,
@@ -66,7 +66,7 @@ def _runtime(algorithm: str) -> MlbRoutingRuntime:
     return rt
 
 
-def _layer_state(rt: MlbRoutingRuntime, layer_id: int = 0) -> EplbLayerState:
+def _layer_state(rt: EvenMoeRoutingRuntime, layer_id: int = 0) -> EplbLayerState:
     state = EplbLayerState()
     state.set_layer_state(
         layer_id,
@@ -106,7 +106,7 @@ def test_ultraep_fast_refresh_degrades_gracefully_without_a_mover():
     ]
 
     phy2log = _placement()
-    rt = MlbRoutingRuntime(
+    rt = EvenMoeRoutingRuntime(
         "ultraep",
         ep_size=EP_SIZE,
         ep_rank=0,
@@ -137,7 +137,7 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
     reference should_refresh gates the same way, rejecting only its provable
     "decode" stage). A decode batch must return before touching the refresh
     gate's counter or moving any weight."""
-    import vllm.distributed.eplb.connector.mlb.runtime as mlb_runtime
+    import vllm.distributed.eplb.connector.evenmoe.runtime as evenmoe_runtime
 
     num_local_physical = NUM_PHYSICAL // EP_SIZE
     expert_weights = [
@@ -145,7 +145,7 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
         for _ in range(NUM_LAYERS)
     ]
     phy2log = _placement()
-    rt = MlbRoutingRuntime(
+    rt = EvenMoeRoutingRuntime(
         "ultraep",
         ep_size=EP_SIZE,
         ep_rank=0,
@@ -163,7 +163,7 @@ def test_ultraep_fast_refresh_skips_decode_batches(monkeypatch):
 
     monkeypatch.setattr(rt, "_commit_placement_weights", _explode)
     rt._ultraep_rank_quota_prefix = torch.zeros(NUM_LAYERS, NUM_LOGICAL, EP_SIZE)
-    monkeypatch.setattr(mlb_runtime, "_current_stage", lambda: "decode")
+    monkeypatch.setattr(evenmoe_runtime, "_current_stage", lambda: "decode")
 
     topk_ids = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
     rt._ultraep_fast_refresh(0, topk_ids, num_unpadded_tokens=None)
@@ -177,7 +177,7 @@ def test_current_stage_under_dp_ignores_this_ranks_own_decode_shape(monkeypatch)
     Answering "decode" off this rank's own descriptor is what splits the group,
     so the DP-reduced flag wins and a locally-decode-shaped batch still reports
     "mixed" when its peers are not decoding."""
-    import vllm.distributed.eplb.connector.mlb.runtime as mlb_runtime
+    import vllm.distributed.eplb.connector.evenmoe.runtime as evenmoe_runtime
     from vllm.forward_context import BatchDescriptor
 
     class _Ctx:
@@ -188,17 +188,17 @@ def test_current_stage_under_dp_ignores_this_ranks_own_decode_shape(monkeypatch)
         dp_metadata = object()
 
     monkeypatch.setattr(
-        mlb_runtime, "is_forward_context_available", lambda: True, raising=False
+        evenmoe_runtime, "is_forward_context_available", lambda: True, raising=False
     )
     monkeypatch.setattr(
         "vllm.forward_context.is_forward_context_available", lambda: True
     )
     monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: _Ctx())
-    assert mlb_runtime._current_stage() == "mixed"
+    assert evenmoe_runtime._current_stage() == "mixed"
 
     # And when every rank really is decoding, all of them say so together.
     _Ctx.uniform_decode_across_dp = True
-    assert mlb_runtime._current_stage() == "decode"
+    assert evenmoe_runtime._current_stage() == "decode"
 
 
 def test_dp_token_counts_reads_the_tensor_that_actually_exists():
@@ -213,7 +213,7 @@ def test_dp_token_counts_reads_the_tensor_that_actually_exists():
     its single-rank fallback everywhere, i.e. produced precisely the per-rank
     disagreement it exists to prevent, while looking like a working fix. The
     assertion that matters here is simply that it is not None."""
-    from vllm.distributed.eplb.connector.mlb.runtime import _dp_token_counts
+    from vllm.distributed.eplb.connector.evenmoe.runtime import _dp_token_counts
     from vllm.forward_context import DPMetadata
 
     counts = torch.tensor([4096, 0, 0, 0], dtype=torch.int32)
@@ -248,7 +248,7 @@ def test_dp_token_counts_reads_the_tensor_that_actually_exists():
 
 
 def test_ultraep_fast_refresh_arms_for_composed_expressions():
-    """`VLLM_MLB_L2_ALGORITHM` carries a whole pipeline expression, not a bare
+    """`VLLM_EVENMOE_L2_ALGORITHM` carries a whole pipeline expression, not a bare
     policy name. UltraEP owns placement in every expression it appears as the
     placement policy of -- `ultraep` and `ultraep+waterfill` alike -- and the
     refresh has to arm for all of them.
@@ -257,7 +257,7 @@ def test_ultraep_fast_refresh_arms_for_composed_expressions():
     silently disarmed it, and the failure was not graceful: `_snapshot` still
     saw an allocated quota tensor and routed through placement tables no
     refresh had ever written."""
-    from vllm.distributed.eplb.connector.mlb.runtime import (
+    from vllm.distributed.eplb.connector.evenmoe.runtime import (
         _algorithm_places_with_ultraep,
     )
 
@@ -273,7 +273,7 @@ def test_ultraep_fast_refresh_arms_for_composed_expressions():
 def test_snapshot_ignores_uncommitted_ultraep_tables():
     """Allocating the quota tensor and filling a layer's slice are different
     events: the bootstrap solve does the first for the whole model, a refresh
-    does the second one layer at a time. Between them the MLB-side tables
+    does the second one layer at a time. Between them the EvenMoE-side tables
     describe a layout the framework never applied, so routing through them
     sends tokens to slots holding other experts. Until a layer is committed,
     the snapshot must hand back the framework's own candidates instead."""
@@ -283,7 +283,7 @@ def test_snapshot_ignores_uncommitted_ultraep_tables():
         for _ in range(NUM_LAYERS)
     ]
     phy2log = _placement()
-    rt = MlbRoutingRuntime(
+    rt = EvenMoeRoutingRuntime(
         "ultraep",
         ep_size=EP_SIZE,
         ep_rank=0,
@@ -314,7 +314,7 @@ def test_snapshot_ignores_uncommitted_ultraep_tables():
         state.logical_to_physical_map[:, : rt._max_replicas],
     )
 
-    # Committed: MLB's own tables win, which is the whole point of the branch.
+    # Committed: EvenMoE's own tables win, which is the whole point of the branch.
     rt._ultraep_committed_layers.add(0)
     snap = rt._snapshot(state, 0)
     assert torch.equal(
@@ -363,7 +363,7 @@ def test_waterfill_is_rejected_unless_the_shared_expert_is_dispatched(monkeypatc
     property being guarded is the same one: never accept the decision and then
     drop it.
     """
-    from vllm.distributed.eplb.connector.mlb.runtime import l2_inapplicable_reason
+    from vllm.distributed.eplb.connector.evenmoe.runtime import l2_inapplicable_reason
 
     monkeypatch.setenv("VLLM_FUSE_SHARED_EXPERTS", "0")
     import importlib
@@ -397,7 +397,7 @@ def test_l2_applicability_is_decided_on_the_config_the_run_uses(monkeypatch):
     """
     from vllm.config.parallel import EPLBConfig, ParallelConfig
 
-    monkeypatch.setenv("VLLM_MLB_L2_ALGORITHM", "ultraep")
+    monkeypatch.setenv("VLLM_EVENMOE_L2_ALGORITHM", "ultraep")
 
     # The default instance takes the algorithm from the environment and leaves
     # it alone: its zero redundancy is a default, not a deployment.
@@ -410,7 +410,7 @@ def test_l2_applicability_is_decided_on_the_config_the_run_uses(monkeypatch):
         data_parallel_size=2,
         enable_expert_parallel=True,
         enable_eplb=True,
-        eplb_config=EPLBConfig(policy="mlb", use_async=False, l2_algorithm="ultraep"),
+        eplb_config=EPLBConfig(policy="evenmoe", use_async=False, l2_algorithm="ultraep"),
     )
     assert assembled.eplb_config.l2_algorithm == ""
 
@@ -419,7 +419,7 @@ def test_l2_applicability_is_decided_on_the_config_the_run_uses(monkeypatch):
     # built from the field defaults looks like, and it must not announce a
     # disable that never applied to any run.
     idle = ParallelConfig(
-        eplb_config=EPLBConfig(policy="mlb", use_async=False, l2_algorithm="ultraep")
+        eplb_config=EPLBConfig(policy="evenmoe", use_async=False, l2_algorithm="ultraep")
     )
     assert idle.eplb_config.l2_algorithm == "ultraep"
 
@@ -452,7 +452,7 @@ def test_placement_commit_refreshes_policy_state():
     state = _layer_state(rt)
     torch.manual_seed(0)
     logical = torch.randint(0, NUM_LOGICAL, (NUM_TOKENS, TOPK), dtype=torch.int64)
-    # The snapshot handed to MLB must reflect the committed maps, not the ones
+    # The snapshot handed to EvenMoE must reflect the committed maps, not the ones
     # captured at registration.
     snapshot = rt._snapshot(state, 0)
     assert torch.equal(
@@ -463,7 +463,7 @@ def test_placement_commit_refreshes_policy_state():
 
 
 def test_capabilities_gate_the_work_the_framework_does():
-    """MLB declares what the framework must prepare; Glue must honour it
+    """EvenMoE declares what the framework must prepare; Glue must honour it
     instead of doing every lifecycle step for every policy."""
     dyn = _runtime("dynamic")
     # dynamic keeps no placement-derived state and needs no dispatch table.
@@ -511,8 +511,8 @@ def test_ultraep_quota_and_candidates_reach_the_snapshot_only_when_set():
     """The per-layer quota table and candidate table UltraEP's L1 solve
     produces have to reach L2 routing through the snapshot *together*, or the
     quota's replica columns get read against vLLM's own candidates -- rebuilt
-    independently from physical_to_logical_map, not guaranteed to share MLB's
-    width or column ordering -- rather than the table MLB solved it against.
+    independently from physical_to_logical_map, not guaranteed to share EvenMoE's
+    width or column ordering -- rather than the table EvenMoE solved it against.
     """
     rt = _runtime("ultraep")
     state = _layer_state(rt)
@@ -527,7 +527,7 @@ def test_ultraep_quota_and_candidates_reach_the_snapshot_only_when_set():
 
     # A refresh stashes the whole per-layer tensors and commits the layer it
     # wrote; _snapshot() must slice each by the layer actually being routed,
-    # and must prefer MLB's own candidate table over vLLM's for those layers.
+    # and must prefer EvenMoE's own candidate table over vLLM's for those layers.
     #
     # Committing is a separate step from stashing on purpose: the bootstrap
     # solve allocates these tensors for the whole model before any refresh has
@@ -568,7 +568,7 @@ def test_commit_is_skipped_for_policies_without_placement_state(monkeypatch):
 def test_only_changed_layers_are_refreshed(monkeypatch):
     """Refreshing an untouched layer is pure stall: a shape-changing rebuild
     costs a JIT build plus warmup per layer."""
-    rt = _runtime("static")  # any policy; we intercept the MLB call
+    rt = _runtime("static")  # any policy; we intercept the EvenMoE call
     seen = []
     monkeypatch.setattr(rt, "requires_placement_state", True)
     monkeypatch.setattr(rt, "_commit_layers", lambda ids: seen.append(list(ids)))
@@ -594,7 +594,7 @@ def test_graphs_plus_rearranging_placement_state_is_refused(monkeypatch):
     import sys
     import types
 
-    from vllm.distributed.eplb.connector.mlb import runtime as mlb_runtime
+    from vllm.distributed.eplb.connector.evenmoe import runtime as evenmoe_runtime
 
     class _Mode:
         name = "FULL_AND_PIECEWISE"
@@ -610,14 +610,14 @@ def test_graphs_plus_rearranging_placement_state_is_refused(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.config", stub)
 
     with pytest.raises(ValueError, match="freed memory|Xid 43"):
-        mlb_runtime._reject_graphs_with_rearranging_placement_state(rearranges=True)
+        evenmoe_runtime._reject_graphs_with_rearranging_placement_state(rearranges=True)
 
     # Pinned placement is the supported combination and must stay allowed --
     # that is how the reported LPLB numbers were measured.
-    mlb_runtime._reject_graphs_with_rearranging_placement_state(rearranges=False)
+    evenmoe_runtime._reject_graphs_with_rearranging_placement_state(rearranges=False)
 
     _Mode.name = "NONE"  # eager is the other escape
-    mlb_runtime._reject_graphs_with_rearranging_placement_state(rearranges=True)
+    evenmoe_runtime._reject_graphs_with_rearranging_placement_state(rearranges=True)
 
 
 def test_initial_placement_is_announced():
@@ -632,13 +632,13 @@ def test_initial_placement_is_announced():
     assert seen == [list(range(NUM_LAYERS))]
 
 
-def _runtime_with_redundancy(num_redundant: int) -> MlbRoutingRuntime:
+def _runtime_with_redundancy(num_redundant: int) -> EvenMoeRoutingRuntime:
     """A runtime whose only interesting property is whether experts repeat."""
     num_physical = NUM_LOGICAL + num_redundant
     phy2log = torch.stack(
         [torch.arange(num_physical) % NUM_LOGICAL for _ in range(NUM_LAYERS)]
     )
-    return MlbRoutingRuntime(
+    return EvenMoeRoutingRuntime(
         "lplb",
         ep_size=EP_SIZE,
         ep_rank=0,
@@ -659,7 +659,7 @@ def test_count_buffers_exist_only_where_a_policy_consumes_them(
     are what make vLLM run a per-layer count kernel and one EP all-reduce per
     step to produce it -- work whose result is then discarded.
     """
-    monkeypatch.delenv("MLB_KEEP_ZERO_REDUNDANCY_COUNTS", raising=False)
+    monkeypatch.delenv("EVENMOE_KEEP_ZERO_REDUNDANCY_COUNTS", raising=False)
     rt = _runtime_with_redundancy(num_redundant)
     assert (rt._logical_count_local is not None) is allocated
     assert (rt._logical_count_global is not None) is allocated
@@ -669,7 +669,7 @@ def test_the_zero_redundancy_override_restores_the_buffers(monkeypatch):
     """The override exists so the skipped work has a measured size rather than
     only an argued one; a benchmark that cannot restore the old path cannot
     report what removing it bought."""
-    monkeypatch.setenv("MLB_KEEP_ZERO_REDUNDANCY_COUNTS", "1")
+    monkeypatch.setenv("EVENMOE_KEEP_ZERO_REDUNDANCY_COUNTS", "1")
     rt = _runtime_with_redundancy(0)
     assert rt._logical_count_local is not None
     assert rt._logical_count_global is not None
@@ -681,16 +681,16 @@ def test_finalize_step_counts_is_inert_without_buffers(monkeypatch):
     These tests run with no distributed init, so an unguarded get_ep_group()
     would raise -- which is exactly the assertion.
     """
-    monkeypatch.delenv("MLB_KEEP_ZERO_REDUNDANCY_COUNTS", raising=False)
+    monkeypatch.delenv("EVENMOE_KEEP_ZERO_REDUNDANCY_COUNTS", raising=False)
     _runtime_with_redundancy(0).finalize_step_counts()
 
 
-def _sized_runtime(algorithm: str, num_redundant: int = 8) -> MlbRoutingRuntime:
+def _sized_runtime(algorithm: str, num_redundant: int = 8) -> EvenMoeRoutingRuntime:
     num_physical = NUM_LOGICAL + num_redundant
     phy2log = torch.stack(
         [torch.arange(num_physical) % NUM_LOGICAL for _ in range(NUM_LAYERS)]
     )
-    return MlbRoutingRuntime(
+    return EvenMoeRoutingRuntime(
         algorithm,
         ep_size=EP_SIZE,
         ep_rank=0,
@@ -747,7 +747,7 @@ def test_placement_and_routing_share_one_balancer():
     owner; ``EplbState`` creates it and binds routing against it.
     """
     from vllm.config.parallel import EPLBConfig
-    from vllm.distributed.eplb.connector.mlb import MoeLoadBalancerConnector
+    from vllm.distributed.eplb.connector.evenmoe import EvenMoeConnector
     from vllm.distributed.eplb.connector.state import (
         ensure_eplb_connector_initialized,
         get_eplb_connector,
@@ -756,9 +756,9 @@ def test_placement_and_routing_share_one_balancer():
 
     reset_eplb_connector()
     try:
-        cfg = EPLBConfig(policy="mlb", use_async=False, l2_algorithm="lplb")
+        cfg = EPLBConfig(policy="evenmoe", use_async=False, l2_algorithm="lplb")
         connector = ensure_eplb_connector_initialized(cfg)
-        assert isinstance(connector, MoeLoadBalancerConnector)
+        assert isinstance(connector, EvenMoeConnector)
         num_physical = NUM_LOGICAL + 8
         phy2log = torch.stack(
             [torch.arange(num_physical) % NUM_LOGICAL for _ in range(NUM_LAYERS)]
@@ -773,7 +773,7 @@ def test_placement_and_routing_share_one_balancer():
             logical_to_physical_map=log2phy,
             logical_replica_count=counts,
         )
-        assert connector.balancer() is routing._mlb
+        assert connector.balancer() is routing._evenmoe
         assert get_eplb_connector() is connector
         assert get_eplb_routing() is routing
     finally:
@@ -845,7 +845,7 @@ def test_the_nearest_replica_table_is_refreshed_on_every_commit():
 def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
     """A committed placement's own tables must be usable by the very next forward.
 
-    `_snapshot` hands the router MLB's candidate table, replica counts and quota
+    `_snapshot` hands the router EvenMoE's candidate table, replica counts and quota
     only for layers in `_ultraep_committed_layers`. That set used to be filled in
     one place -- inside `_ultraep_fast_refresh` -- while the commit path filled
     the three tables for *every* layer and marked none of them. The router
@@ -858,7 +858,7 @@ def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
     commits, so they are consistent for every layer at that moment; there is
     nothing to wait for.
     """
-    from vllm.distributed.eplb.connector.mlb import runtime as mlb_runtime
+    from vllm.distributed.eplb.connector.evenmoe import runtime as evenmoe_runtime
 
     num_layers, num_logical, max_replicas = 4, NUM_LOGICAL, 3
 
@@ -892,25 +892,25 @@ def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
 
     # A connector with the fake balancer and routing installed, without
     # importing evenmoe in its constructor.
-    from vllm.distributed.eplb.connector.mlb import connector as connector_module
-    from vllm.distributed.eplb.connector.mlb.connector import (
-        MoeLoadBalancerConnector,
+    from vllm.distributed.eplb.connector.evenmoe import connector as connector_module
+    from vllm.distributed.eplb.connector.evenmoe.connector import (
+        EvenMoeConnector,
     )
 
-    connector = MoeLoadBalancerConnector.__new__(MoeLoadBalancerConnector)
+    connector = EvenMoeConnector.__new__(EvenMoeConnector)
     connector.algorithm = "ultraep"
     connector._balancer = _Balancer()
     connector._balancer_kwargs = None
     connector.routing = routing
-    monkeypatch.setattr(connector_module, "current_mlb_connector", lambda: connector)
+    monkeypatch.setattr(connector_module, "current_evenmoe_connector", lambda: connector)
     # plan_placement imports this inside the function body, so the name has to
-    # be replaced where it is looked up rather than on mlb_runtime itself.
+    # be replaced where it is looked up rather than on evenmoe_runtime itself.
     monkeypatch.setattr(
         "evenmoe.adapters.vllm.to_vllm_physical_to_logical",
         lambda plan: plan.physical_to_logical_map,
     )
 
-    mlb_runtime.plan_placement(object())
+    evenmoe_runtime.plan_placement(object())
 
     assert routing._ultraep_rank_quota_prefix is not None, (
         "the commit path must stash the quota"

@@ -6,7 +6,7 @@
 By default vLLM runs a MoE layer's shared expert as a plain MLP replicated on
 every rank: every rank computes it for its own tokens and nothing crosses the
 all-to-all. That is cheap, but it means a shared-expert token has no *choice*
-of rank, so a load balancer has nothing to decide -- which is why MLB's
+of rank, so a load balancer has nothing to decide -- which is why EvenMoE's
 Waterfill L2 policy (``RoutingPhase.SHARED_EXPERT``) is inapplicable on vLLM
 today.
 
@@ -243,7 +243,7 @@ def shared_expert_fusion_enabled() -> bool:
     The env switch turns it on, and so does asking for an L2 pipeline that
     routes the shared expert: waterfill picks a rank for it, and there is no
     rank to pick unless it goes through dispatch. Selecting that pipeline and
-    leaving the switch off used to leave MLB's L2 quietly disabled -- the
+    leaving the switch off used to leave EvenMoE's L2 quietly disabled -- the
     configuration was refused, a line went by in the log, and the run carried
     on doing none of what was asked for. Turning it on and saying so is how
     SGLang resolves the same pair (`enable_deepep_waterfill` forces shared

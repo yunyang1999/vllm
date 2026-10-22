@@ -587,7 +587,7 @@ class EplbState:
         # routing boundary.
         #
         # Read from the config rather than the environment: EPLBConfig resolves
-        # $VLLM_MLB_L2_ALGORITHM once and clears it for placements the policy
+        # $VLLM_EVENMOE_L2_ALGORITHM once and clears it for placements the policy
         # cannot act on, so by here the answer already accounts for redundancy.
         from vllm.distributed.eplb.connector.state import (
             ensure_eplb_connector_initialized,
@@ -622,7 +622,7 @@ class EplbState:
                 # for its own periodic rearrangement. A policy that re-plans
                 # placement mid-run has to move weight to match it, and that is
                 # this file's machinery, not something a policy brings its own
-                # copy of -- see MlbRoutingRuntime._commit_placement_weights.
+                # copy of -- see EvenMoeRoutingRuntime._commit_placement_weights.
                 expert_buffer=expert_buffer,
                 communicator=communicator,
                 # A step interval that the run can actually reach means the

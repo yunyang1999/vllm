@@ -19,7 +19,7 @@ living in vLLM:
 
 Nothing here is active unless ``--eplb-config`` names a connector
 (``connector``, optionally ``connector_module_path`` for one outside the
-vLLM tree; ``policy: "mlb"`` is an alias for the built-in ``mlb`` connector).
+vLLM tree; ``policy: "evenmoe"`` is an alias for the built-in ``evenmoe`` connector).
 The classmethods answer from configuration alone, before any engine exists,
 so config validation and layer construction can ask them; the instance
 methods need the bound engine.

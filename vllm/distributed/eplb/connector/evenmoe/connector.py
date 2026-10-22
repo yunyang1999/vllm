@@ -22,8 +22,8 @@ from vllm.distributed.eplb.connector.base import (
     EplbRoutingCapabilities,
     EplbRoutingRuntimeBase,
 )
-from vllm.distributed.eplb.connector.mlb.runtime import (
-    MlbRoutingRuntime,
+from vllm.distributed.eplb.connector.evenmoe.runtime import (
+    EvenMoeRoutingRuntime,
     VllmRoutingCollectives,
     _reject_graphs_with_rearranging_placement_state,
     l2_inapplicable_reason,
@@ -38,8 +38,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class MoeLoadBalancerConnector(EplbConnectorBase):
-    """Placement through MLB's L1 policies, routing through its L2 pipeline."""
+class EvenMoeConnector(EplbConnectorBase):
+    """Placement through EvenMoE's L1 policies, routing through its L2 pipeline."""
 
     def __init__(self, eplb_config: EPLBConfig) -> None:
         super().__init__(eplb_config)
@@ -58,9 +58,9 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
     def placement_policy(
         cls, eplb_config: EPLBConfig
     ) -> type[AbstractEplbPolicy] | None:
-        from vllm.distributed.eplb.connector.mlb.policy import MlbEplbPolicy
+        from vllm.distributed.eplb.connector.evenmoe.policy import EvenMoeEplbPolicy
 
-        return MlbEplbPolicy
+        return EvenMoeEplbPolicy
 
     @classmethod
     def routing_capabilities(
@@ -80,7 +80,7 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
                 getattr(caps, "requires_rank_dispatch_map", False)
             ),
             routes_shared_expert=bool(getattr(caps, "routes_shared_expert", False)),
-            # Same conservative default as MlbRoutingRuntime: a pipeline that
+            # Same conservative default as EvenMoeRoutingRuntime: a pipeline that
             # does not declare the capability is treated as DBO-unsafe.
             supports_concurrent_microbatches=bool(
                 getattr(caps, "supports_concurrent_microbatches", False)
@@ -157,7 +157,7 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
         self._balancer = MoELoadBalancer.from_algorithm(
             self.algorithm, **self._balancer_kwargs
         )
-        runtime = MlbRoutingRuntime(
+        runtime = EvenMoeRoutingRuntime(
             self.algorithm,
             ep_size=ep_size,
             ep_rank=ep_rank,
@@ -205,8 +205,8 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
         self._balancer_kwargs = None
 
 
-def current_mlb_connector() -> MoeLoadBalancerConnector:
-    """The engine's MLB connector, created from the current config on demand.
+def current_evenmoe_connector() -> EvenMoeConnector:
+    """The engine's EvenMoE connector, created from the current config on demand.
 
     The placement policy is a classmethod that vLLM calls at a rearrangement;
     by then ``EplbState`` has created the connector. Creating it here covers a
@@ -233,9 +233,9 @@ def current_mlb_connector() -> MoeLoadBalancerConnector:
 
             eplb_config = EPLBConfig()
         connector = ensure_eplb_connector_initialized(
-            eplb_config, MoeLoadBalancerConnector
+            eplb_config, EvenMoeConnector
         )
-    if not isinstance(connector, MoeLoadBalancerConnector):
+    if not isinstance(connector, EvenMoeConnector):
         raise TypeError(
             "The engine's EPLB connector is not EvenMoE: "
             f"{type(connector).__name__}"
