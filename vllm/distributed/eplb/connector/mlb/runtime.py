@@ -79,7 +79,7 @@ def _algorithm_places_with_ultraep(algorithm: str) -> bool:
     alike. An unparsable expression is not UltraEP's to claim; the caller
     reports that separately.
     """
-    from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+    from evenmoe.core.routing_pipeline import RoutingPipeline
 
     try:
         return RoutingPipeline.from_value(algorithm).placement_policy == "ultraep"
@@ -190,7 +190,7 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
         expert_buffer: Any | None = None,
         communicator: Any | None = None,
     ) -> None:
-        from moe_load_balancer import MoELoadBalancer
+        from evenmoe import MoELoadBalancer
 
         self.algorithm = algorithm
         self.ep_size = ep_size
@@ -216,7 +216,7 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
         # [num_physical_experts] — slot i belongs to rank (i // experts_per_rank).
         # Passed to every PlacementSnapshot so LPLB can incorporate cross-GPU
         # transfer cost; SGLang always provides this, we build it from topology.
-        from moe_load_balancer.adapters.vllm import build_physical_to_rank_map
+        from evenmoe.adapters.vllm import build_physical_to_rank_map
 
         self._physical_to_rank_map = build_physical_to_rank_map(
             num_physical_experts,
@@ -531,7 +531,7 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
             )
             return
 
-        from moe_load_balancer.policies.l1 import RefreshGate
+        from evenmoe.policies.l1 import RefreshGate
 
         self._ultraep_expert_weights = expert_weights
         self._ultraep_expert_buffer = expert_buffer
@@ -612,7 +612,7 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
         layer_state: EplbLayerState,
         layer_id: int,
     ) -> Any:
-        from moe_load_balancer.adapters.vllm import (
+        from evenmoe.adapters.vllm import (
             collapse_candidates_to_local,
             to_placement_snapshot,
         )
@@ -704,7 +704,7 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
             self._fixed_counts = None
             return
 
-        from moe_load_balancer.adapters.vllm import nearest_replica_table
+        from evenmoe.adapters.vllm import nearest_replica_table
 
         self._default_replicas = torch.stack(
             [
@@ -811,7 +811,7 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
 
     def _commit_layers(self, layer_ids) -> None:
         """Hand MLB the committed placement of the given layers."""
-        from moe_load_balancer.core.types import PlacementSnapshot
+        from evenmoe.core.types import PlacementSnapshot
 
         for layer_id in layer_ids:
             self._mlb.on_placement_committed(
@@ -1031,8 +1031,8 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
         ):
             return
 
-        from moe_load_balancer.adapters.vllm import to_placement_request
-        from moe_load_balancer.kernels.ops.counting import count_logical_experts
+        from evenmoe.adapters.vllm import to_placement_request
+        from evenmoe.kernels.ops.counting import count_logical_experts
 
         from vllm.distributed import get_ep_group
 
@@ -1536,11 +1536,11 @@ class MlbRoutingRuntime(EplbRoutingRuntimeBase):
         the extra top-k column itself, applying 1/routed_scaling_factor as that
         column's weight in the layer (see shared_expert_fusion.py).
         """
-        from moe_load_balancer.adapters.vllm import (
+        from evenmoe.adapters.vllm import (
             to_routing_request,
             to_vllm_shared_expert_rank,
         )
-        from moe_load_balancer.kernels.ops.counting import count_logical_experts
+        from evenmoe.kernels.ops.counting import count_logical_experts
 
         self._last_physical_ids = None
         self._last_shared_expert_rank = None
@@ -1703,7 +1703,7 @@ def l2_pipeline_capabilities(algorithm: str):
     if not algorithm:
         return None
     try:
-        from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+        from evenmoe.core.routing_pipeline import RoutingPipeline
 
         return RoutingPipeline.from_value(algorithm).capabilities
     except Exception:
@@ -1734,8 +1734,8 @@ def l2_inapplicable_reason(
     if not algorithm:
         return None
     try:
-        from moe_load_balancer import ExpertDeploymentConfig
-        from moe_load_balancer.core.routing_pipeline import RoutingPipeline
+        from evenmoe import ExpertDeploymentConfig
+        from evenmoe.core.routing_pipeline import RoutingPipeline
 
         pipeline = RoutingPipeline.from_value(algorithm)
     except Exception:
@@ -1771,7 +1771,7 @@ def plan_placement(request):
 
 def placement_request(*args, **kwargs):
     """Translate vLLM's rebalance arguments into the neutral request."""
-    from moe_load_balancer.adapters.vllm import to_placement_request
+    from evenmoe.adapters.vllm import to_placement_request
 
     return to_placement_request(*args, **kwargs)
 
@@ -1814,5 +1814,5 @@ def _reject_graphs_with_rearranging_placement_state(rearranges: bool) -> None:
         "-- replay then reads freed memory (Xid 43). Either disable "
         "rearrangement (eplb_config step_interval high, or policy that does "
         "not re-plan), or set enforce_eager=True. Fixing this properly needs "
-        "a fixed-shape solver state in moe_load_balancer."
+        "a fixed-shape solver state in evenmoe."
     )

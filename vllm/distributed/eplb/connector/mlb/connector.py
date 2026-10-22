@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The MoE Load Balancer (``moe_load_balancer``) as an EPLB connector.
+"""EvenMoE (``evenmoe``, formerly the MoE Load Balancer) as an EPLB connector.
 
 One balancer per engine, serving both placement and routing. SGLang gives an
 engine a single MoELoadBalancer and lets L1 and L2 share it; a throwaway
@@ -43,7 +43,7 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
 
     def __init__(self, eplb_config: EPLBConfig) -> None:
         super().__init__(eplb_config)
-        from moe_load_balancer import MoELoadBalancer
+        from evenmoe import MoELoadBalancer
 
         # The L2 expression; "" means placement only. EPLBConfig has already
         # resolved the environment default and cleared it for deployments the
@@ -110,7 +110,7 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
     def balancer(self):
         """The single MoELoadBalancer this engine uses."""
         if self._balancer is None:
-            from moe_load_balancer import MoELoadBalancer
+            from evenmoe import MoELoadBalancer
 
             if self._balancer_kwargs is None:
                 self._balancer = MoELoadBalancer()
@@ -146,7 +146,7 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
         """
         if not self.algorithm:
             return None
-        from moe_load_balancer import MoELoadBalancer
+        from evenmoe import MoELoadBalancer
 
         self._balancer_kwargs = {
             "ep_size": ep_size,
@@ -177,7 +177,7 @@ class MoeLoadBalancerConnector(EplbConnectorBase):
 
     def plan_placement(self, request):
         """Run L1 through the engine's balancer and hand back vLLM's one map."""
-        from moe_load_balancer.adapters.vllm import to_vllm_physical_to_logical
+        from evenmoe.adapters.vllm import to_vllm_physical_to_logical
 
         plan = self.balancer().plan_placement(request)
         # UltraEP is the only L1 policy that publishes this; every other plan's
@@ -237,7 +237,7 @@ def current_mlb_connector() -> MoeLoadBalancerConnector:
         )
     if not isinstance(connector, MoeLoadBalancerConnector):
         raise TypeError(
-            "The engine's EPLB connector is not the MoE Load Balancer: "
+            "The engine's EPLB connector is not EvenMoE: "
             f"{type(connector).__name__}"
         )
     return connector

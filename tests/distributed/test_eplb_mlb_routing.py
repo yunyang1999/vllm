@@ -15,7 +15,7 @@ expert the router chose.
 import pytest
 import torch
 
-pytest.importorskip("moe_load_balancer")
+pytest.importorskip("evenmoe")
 
 from vllm.distributed.eplb.connector.mlb.runtime import (  # noqa: E402
     MlbRoutingRuntime,
@@ -326,7 +326,7 @@ def test_synthesized_default_prefers_local_replicas():
     """VLLM keeps no per-rank dispatch table, so the adapter builds one.
     It must prefer a replica this rank owns -- that is the locality SGLang
     gets for free by collapsing its candidate list."""
-    from moe_load_balancer.adapters.vllm import nearest_replica_table
+    from evenmoe.adapters.vllm import nearest_replica_table
 
     phy2log = _placement()
     log2phy, counts = compute_logical_maps(phy2log, NUM_LOGICAL)
@@ -891,7 +891,7 @@ def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
     routing = _Routing()
 
     # A connector with the fake balancer and routing installed, without
-    # importing moe_load_balancer in its constructor.
+    # importing evenmoe in its constructor.
     from vllm.distributed.eplb.connector.mlb import connector as connector_module
     from vllm.distributed.eplb.connector.mlb.connector import (
         MoeLoadBalancerConnector,
@@ -906,7 +906,7 @@ def test_bootstrap_solve_is_routed_against_not_just_stored(monkeypatch):
     # plan_placement imports this inside the function body, so the name has to
     # be replaced where it is looked up rather than on mlb_runtime itself.
     monkeypatch.setattr(
-        "moe_load_balancer.adapters.vllm.to_vllm_physical_to_logical",
+        "evenmoe.adapters.vllm.to_vllm_physical_to_logical",
         lambda plan: plan.physical_to_logical_map,
     )
 

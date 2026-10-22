@@ -195,11 +195,11 @@ staging buffer and communicator. The interface is `vllm.distributed.eplb.connect
 call). Built-in connectors are registered by name in `EplbConnectorFactory`; a connector maintained
 outside the tree is selected with `connector_module_path` plus its class name in `connector`.
 
-### MoE Load Balancer connector
+### EvenMoE (MoE Load Balancer) connector
 
 `connector: "mlb"` (or the older spelling `policy: "mlb"`) delegates expert placement, and
 optionally per-token replica routing, to the
-[MoE Load Balancer](https://github.com/xutizhou/moe_load_balancer) (`moe_load_balancer`), a
+[EvenMoE](https://github.com/ai-dynamo/evenmoe) (`evenmoe`, formerly the MoE Load Balancer), a
 framework-neutral library of expert-parallel load-balancing policies. vLLM imports it lazily, so
 nothing changes unless the connector is selected; install it into the serving environment first.
 

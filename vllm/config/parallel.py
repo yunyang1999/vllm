@@ -95,7 +95,7 @@ class EPLBConfig:
     """The policy type for expert parallel load balancing (EPLB)."""
 
     l2_algorithm: str = ""
-    """MoE Load Balancer routing expression for the L2 stage, which decides
+    """EvenMoE routing expression for the L2 stage, which decides
     which *replica* of a logical expert each token goes to. Empty leaves vLLM's
     built-in choice in place. Defaults to ``$VLLM_MLB_L2_ALGORITHM``."""
 
@@ -114,7 +114,7 @@ class EPLBConfig:
     connector: str | None = None
     """Load-balancer connector that supplies the placement policy and, with
     ``l2_algorithm``, per-token replica routing: a registered name (``"mlb"``,
-    the MoE Load Balancer) or, with ``connector_module_path``, a class name in
+    EvenMoE) or, with ``connector_module_path``, a class name in
     that module. ``policy: "mlb"`` is an alias for ``connector: "mlb"``."""
 
     connector_module_path: str | None = None
