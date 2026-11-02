@@ -893,6 +893,8 @@ class EplbState:
                     self._step_dumper.push(
                         is_dummy, expert_load_pass_list[0], local_tokens
                     )
+            log_every = max(1, envs.VLLM_EPLB_BALANCEDNESS_LOG_EVERY)
+            if ep_group.rank() == 0 and self.expert_rearrangement_step % log_every == 0:
                 stats: list[tuple[str, torch.Tensor]] = []
                 for expert_load_pass, eplb_model_state in zip(
                     expert_load_pass_list, self.model_states.values()

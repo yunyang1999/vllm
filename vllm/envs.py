@@ -323,6 +323,7 @@ if TYPE_CHECKING:
     EVENMOE_TIME_REFRESH: int = 0
     VLLM_EPLB_DUMP_STEP_LOAD_PATH: str | None = None
     EVENMOE_FORCE_UNIFORM_ROUTING: bool = False
+    VLLM_EPLB_BALANCEDNESS_LOG_EVERY: int = 1
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_MORI_EP_V2: bool | None = None
     VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD: int = 256
@@ -2275,6 +2276,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert load is perfectly balanced. Outputs are garbage; timing only.
     "EVENMOE_FORCE_UNIFORM_ROUTING": lambda: (
         os.getenv("EVENMOE_FORCE_UNIFORM_ROUTING", "0") == "1"
+    ),
+    # Print the EPLB balancedness line only every N logged steps; the per-step
+    # dump above still sees every step. Keeps a per-step interval from writing
+    # thirty log lines a second.
+    "VLLM_EPLB_BALANCEDNESS_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_EPLB_BALANCEDNESS_LOG_EVERY", "1")
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput
