@@ -255,8 +255,8 @@ class _StepLoadDumper:
     set. ``push`` queues an async device-to-host copy of one logged step's
     all-reduced ``expert_load_pass`` (``[num_moe_layers, num_physical_experts]``)
     together with every rank's unpadded token count for that forward; finished
-    copies are written as ``.npz`` chunks (``step``, ``is_dummy``, ``load``,
-    ``local_tokens``). The offline analysis derives per-step, per-layer token
+    copies are written as ``.npz`` chunks (``step``, ``is_dummy``, ``wall``,
+    ``load``, ``local_tokens``). The offline analysis derives per-step, per-layer token
     and block-time imbalance from these, so nothing is aggregated here.
     """
 
@@ -265,9 +265,9 @@ class _StepLoadDumper:
         os.makedirs(path, exist_ok=True)
         self.chunk_steps = chunk_steps
         self._pending: deque[
-            tuple[int, bool, torch.Tensor, torch.Tensor, torch.Event]
+            tuple[int, bool, float, torch.Tensor, torch.Tensor, torch.Event]
         ] = deque()
-        self._ready: list[tuple[int, bool, torch.Tensor, torch.Tensor]] = []
+        self._ready: list[tuple[int, bool, float, torch.Tensor, torch.Tensor]] = []
         self._counter = 0
         self._chunk = 0
         atexit.register(self.close)
@@ -283,19 +283,21 @@ class _StepLoadDumper:
         host_tokens.copy_(local_tokens, non_blocking=True)
         done = torch.Event()
         done.record()
-        self._pending.append((self._counter, is_dummy, host_load, host_tokens, done))
+        self._pending.append(
+            (self._counter, is_dummy, time.time(), host_load, host_tokens, done)
+        )
         self._counter += 1
         self._drain(block=False)
 
     def _drain(self, block: bool) -> None:
         while self._pending:
-            step, is_dummy, host_load, host_tokens, done = self._pending[0]
+            step, is_dummy, wall, host_load, host_tokens, done = self._pending[0]
             if block:
                 done.synchronize()
             elif not done.query():
                 break
             self._pending.popleft()
-            self._ready.append((step, is_dummy, host_load, host_tokens))
+            self._ready.append((step, is_dummy, wall, host_load, host_tokens))
         if len(self._ready) >= self.chunk_steps or (block and self._ready):
             self._flush()
 
@@ -304,13 +306,19 @@ class _StepLoadDumper:
             return
         steps = np.array([r[0] for r in self._ready], dtype=np.int64)
         dummy = np.array([r[1] for r in self._ready], dtype=np.bool_)
-        loads = np.stack([r[2].numpy() for r in self._ready])
-        tokens = np.stack([r[3].numpy() for r in self._ready])
+        wall = np.array([r[2] for r in self._ready], dtype=np.float64)
+        loads = np.stack([r[3].numpy() for r in self._ready])
+        tokens = np.stack([r[4].numpy() for r in self._ready])
         name = f"steps_{self._chunk:05d}_{int(steps[0])}_{int(steps[-1])}.npz"
         out = os.path.join(self.dir, name)
         with open(out + ".tmp", "wb") as f:
             np.savez_compressed(
-                f, step=steps, is_dummy=dummy, load=loads, local_tokens=tokens
+                f,
+                step=steps,
+                is_dummy=dummy,
+                wall=wall,
+                load=loads,
+                local_tokens=tokens,
             )
         os.replace(out + ".tmp", out)
         self._ready.clear()
