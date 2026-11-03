@@ -463,7 +463,12 @@ class BaseRouter(FusedMoERouter):
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
 
-        topk_ids = maybe_force_uniform_routing(topk_ids, router_logits.shape[-1])
+        if envs.EVENMOE_FORCE_UNIFORM_ROUTING:
+            from vllm.distributed import get_ep_group
+
+            topk_ids = maybe_force_uniform_routing(
+                topk_ids, router_logits.shape[-1], get_ep_group().world_size
+            )
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
