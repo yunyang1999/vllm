@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import torch
 
+from vllm.distributed.eplb import layer_timing
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -1428,7 +1429,8 @@ class RoutedExperts(PluggableLayer):
         assert not self.quant_method.is_monolithic
 
         # Modular kernels use pre-computed routing
-        return self.quant_method.apply(
+        _timer = layer_timing.record_start(self)
+        out = self.quant_method.apply(
             layer=self,
             x=x,
             topk_weights=topk_weights,
@@ -1436,6 +1438,8 @@ class RoutedExperts(PluggableLayer):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+        layer_timing.record_end(_timer)
+        return out
 
     def forward_monolithic(
         self,
