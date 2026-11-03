@@ -809,7 +809,10 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 is_padding = is_padding[:num_tokens]
 
         topk_ids = maybe_force_uniform_routing(
-            topk_ids, self.num_logical_experts, get_ep_group().world_size
+            topk_ids,
+            self.num_logical_experts,
+            get_ep_group().world_size,
+            get_ep_group().rank_in_group,
         )
 
         # Capture logical ids; staging maps them to EPLB physical replicas.
