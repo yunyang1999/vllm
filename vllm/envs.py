@@ -324,6 +324,7 @@ if TYPE_CHECKING:
     VLLM_EPLB_DUMP_STEP_LOAD_PATH: str | None = None
     EVENMOE_FORCE_UNIFORM_ROUTING: bool = False
     VLLM_EPLB_BALANCEDNESS_LOG_EVERY: int = 1
+    VLLM_EPLB_LAYER_TIMING_EVERY: int = 0
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_MORI_EP_V2: bool | None = None
     VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD: int = 256
@@ -2282,6 +2283,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # thirty log lines a second.
     "VLLM_EPLB_BALANCEDNESS_LOG_EVERY": lambda: int(
         os.getenv("VLLM_EPLB_BALANCEDNESS_LOG_EVERY", "1")
+    ),
+    # Decode-balance study: every N logged EPLB steps, read per-MoE-layer CUDA
+    # event timings on every EP rank and store them with the per-step load
+    # dump (``layer_ms``). 0 disables the events entirely.
+    "VLLM_EPLB_LAYER_TIMING_EVERY": lambda: int(
+        os.getenv("VLLM_EPLB_LAYER_TIMING_EVERY", "0")
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput

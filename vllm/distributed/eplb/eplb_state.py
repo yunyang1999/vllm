@@ -55,6 +55,7 @@ from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
 
+from . import layer_timing
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_utils import CpuGpuEvent
@@ -265,15 +266,24 @@ class _StepLoadDumper:
         os.makedirs(path, exist_ok=True)
         self.chunk_steps = chunk_steps
         self._pending: deque[
-            tuple[int, bool, float, torch.Tensor, torch.Tensor, torch.Event]
+            tuple[
+                int, bool, float, torch.Tensor, torch.Tensor,
+                torch.Tensor | None, torch.Event,
+            ]
         ] = deque()
-        self._ready: list[tuple[int, bool, float, torch.Tensor, torch.Tensor]] = []
+        self._ready: list[
+            tuple[int, bool, float, torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ] = []
         self._counter = 0
         self._chunk = 0
         atexit.register(self.close)
 
     def push(
-        self, is_dummy: bool, load: torch.Tensor, local_tokens: torch.Tensor
+        self,
+        is_dummy: bool,
+        load: torch.Tensor,
+        local_tokens: torch.Tensor,
+        layer_ms: torch.Tensor | None = None,
     ) -> None:
         host_load = torch.empty(load.shape, dtype=torch.int32, pin_memory=PIN_MEMORY)
         host_load.copy_(load, non_blocking=True)
@@ -284,20 +294,20 @@ class _StepLoadDumper:
         done = torch.Event()
         done.record()
         self._pending.append(
-            (self._counter, is_dummy, time.time(), host_load, host_tokens, done)
+            (self._counter, is_dummy, time.time(), host_load, host_tokens, layer_ms, done)
         )
         self._counter += 1
         self._drain(block=False)
 
     def _drain(self, block: bool) -> None:
         while self._pending:
-            step, is_dummy, wall, host_load, host_tokens, done = self._pending[0]
+            step, is_dummy, wall, host_load, host_tokens, layer_ms, done = self._pending[0]
             if block:
                 done.synchronize()
             elif not done.query():
                 break
             self._pending.popleft()
-            self._ready.append((step, is_dummy, wall, host_load, host_tokens))
+            self._ready.append((step, is_dummy, wall, host_load, host_tokens, layer_ms))
         if len(self._ready) >= self.chunk_steps or (block and self._ready):
             self._flush()
 
@@ -309,6 +319,16 @@ class _StepLoadDumper:
         wall = np.array([r[2] for r in self._ready], dtype=np.float64)
         loads = np.stack([r[3].numpy() for r in self._ready])
         tokens = np.stack([r[4].numpy() for r in self._ready])
+        extra = {}
+        timed = [r[5] for r in self._ready if r[5] is not None]
+        if timed:
+            # [steps, ep, layers] in ms; NaN on steps that were not sampled.
+            ep, nl = timed[0].shape
+            layer_ms = np.full((len(self._ready), ep, nl), np.nan, dtype=np.float32)
+            for i, r in enumerate(self._ready):
+                if r[5] is not None and tuple(r[5].shape) == (ep, nl):
+                    layer_ms[i] = r[5].numpy()
+            extra["layer_ms"] = layer_ms
         name = f"steps_{self._chunk:05d}_{int(steps[0])}_{int(steps[-1])}.npz"
         out = os.path.join(self.dir, name)
         with open(out + ".tmp", "wb") as f:
@@ -319,6 +339,7 @@ class _StepLoadDumper:
                 wall=wall,
                 load=loads,
                 local_tokens=tokens,
+                **extra,
             )
         os.replace(out + ".tmp", out)
         self._ready.clear()
@@ -888,10 +909,20 @@ class EplbState:
             local_tokens = (
                 self._gather_local_tokens(ep_group) if self._dump_step_loads else None
             )
+            # Per-layer MoE timings on sampled steps (every rank takes part in
+            # the collectives; the condition is identical on all ranks).
+            layer_ms = None
+            timing_every = layer_timing.every()
+            if (
+                self._dump_step_loads
+                and timing_every > 0
+                and self.expert_rearrangement_step % timing_every == 0
+            ):
+                layer_ms = layer_timing.collect(self.device, ep_group)
             if ep_group.rank() == 0:
                 if self._step_dumper is not None and local_tokens is not None:
                     self._step_dumper.push(
-                        is_dummy, expert_load_pass_list[0], local_tokens
+                        is_dummy, expert_load_pass_list[0], local_tokens, layer_ms
                     )
             log_every = max(1, envs.VLLM_EPLB_BALANCEDNESS_LOG_EVERY)
             if ep_group.rank() == 0 and self.expert_rearrangement_step % log_every == 0:

@@ -20,6 +20,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
+from vllm.distributed.eplb import layer_timing
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -801,6 +802,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 f"sized for {self.max_num_tokens}."
             )
         self._synchronize_first_launch()
+        _timer = layer_timing.record_start(self)
 
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -896,6 +898,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
             fast_math=self.fast_math,
             **kwargs,
         )
+        layer_timing.record_end(_timer)
         if shared_experts is not None:
             y += shared_experts(hidden_states)
         return y
