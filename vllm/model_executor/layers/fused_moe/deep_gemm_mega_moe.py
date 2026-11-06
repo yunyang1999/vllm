@@ -23,6 +23,9 @@ from vllm.distributed import get_ep_group
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.balance_study import (
+    maybe_force_uniform_routing,
+)
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
     prepare_megamoe_inputs,
     prepare_megamoe_nvfp4_inputs,
@@ -804,6 +807,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
             is_padding = get_forward_context().is_padding
             if is_padding is not None:
                 is_padding = is_padding[:num_tokens]
+
+        topk_ids = maybe_force_uniform_routing(topk_ids, self.num_logical_experts)
 
         # Capture logical ids; staging maps them to EPLB physical replicas.
         if self.capture_fn is not None:

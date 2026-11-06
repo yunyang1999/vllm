@@ -25,12 +25,15 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import atexit
+import os
 import threading
 import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_gather_into_tensor, all_reduce
 
@@ -245,6 +248,81 @@ class EplbModelState:
 _ASYNC_COMMITTED_LAYERS: set[int] = set()
 
 
+class _StepLoadDumper:
+    """Per-step global expert load recorder for the decode-balance study.
+
+    Only EP rank 0 owns one, and only when ``VLLM_EPLB_DUMP_STEP_LOAD_PATH`` is
+    set. ``push`` queues an async device-to-host copy of one logged step's
+    all-reduced ``expert_load_pass`` (``[num_moe_layers, num_physical_experts]``)
+    together with every rank's unpadded token count for that forward; finished
+    copies are written as ``.npz`` chunks (``step``, ``is_dummy``, ``load``,
+    ``local_tokens``). The offline analysis derives per-step, per-layer token
+    and block-time imbalance from these, so nothing is aggregated here.
+    """
+
+    def __init__(self, path: str, chunk_steps: int = 256) -> None:
+        self.dir = path
+        os.makedirs(path, exist_ok=True)
+        self.chunk_steps = chunk_steps
+        self._pending: deque[
+            tuple[int, bool, torch.Tensor, torch.Tensor, torch.Event]
+        ] = deque()
+        self._ready: list[tuple[int, bool, torch.Tensor, torch.Tensor]] = []
+        self._counter = 0
+        self._chunk = 0
+        atexit.register(self.close)
+
+    def push(
+        self, is_dummy: bool, load: torch.Tensor, local_tokens: torch.Tensor
+    ) -> None:
+        host_load = torch.empty(load.shape, dtype=torch.int32, pin_memory=PIN_MEMORY)
+        host_load.copy_(load, non_blocking=True)
+        host_tokens = torch.empty(
+            local_tokens.shape, dtype=torch.int32, pin_memory=PIN_MEMORY
+        )
+        host_tokens.copy_(local_tokens, non_blocking=True)
+        done = torch.Event()
+        done.record()
+        self._pending.append((self._counter, is_dummy, host_load, host_tokens, done))
+        self._counter += 1
+        self._drain(block=False)
+
+    def _drain(self, block: bool) -> None:
+        while self._pending:
+            step, is_dummy, host_load, host_tokens, done = self._pending[0]
+            if block:
+                done.synchronize()
+            elif not done.query():
+                break
+            self._pending.popleft()
+            self._ready.append((step, is_dummy, host_load, host_tokens))
+        if len(self._ready) >= self.chunk_steps or (block and self._ready):
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._ready:
+            return
+        steps = np.array([r[0] for r in self._ready], dtype=np.int64)
+        dummy = np.array([r[1] for r in self._ready], dtype=np.bool_)
+        loads = np.stack([r[2].numpy() for r in self._ready])
+        tokens = np.stack([r[3].numpy() for r in self._ready])
+        name = f"steps_{self._chunk:05d}_{int(steps[0])}_{int(steps[-1])}.npz"
+        out = os.path.join(self.dir, name)
+        with open(out + ".tmp", "wb") as f:
+            np.savez_compressed(
+                f, step=steps, is_dummy=dummy, load=loads, local_tokens=tokens
+            )
+        os.replace(out + ".tmp", out)
+        self._ready.clear()
+        self._chunk += 1
+
+    def close(self) -> None:
+        try:
+            self._drain(block=True)
+        except Exception:  # noqa: BLE001 -- best effort at interpreter exit
+            logger.exception("step load dump: final flush failed")
+
+
 class EplbState:
     """EplbState of each expert parallel model. Key is the model config hash."""
 
@@ -297,6 +375,12 @@ class EplbState:
         ] = deque()
         """Balancedness stats whose copies to the host are in flight, oldest
         first."""
+        self._dump_step_loads = bool(envs.VLLM_EPLB_DUMP_STEP_LOAD_PATH)
+        """Whether every rank joins the per-step token-count gather (all ranks
+        see the same environment, so the collective is uniform)."""
+        self._step_dumper: _StepLoadDumper | None = None
+        if self._dump_step_loads and get_ep_group().rank_in_group == 0:
+            self._step_dumper = _StepLoadDumper(envs.VLLM_EPLB_DUMP_STEP_LOAD_PATH)
         self.is_async: bool = False
         """
         The flag indicates whether the EPLB is running in async mode.
@@ -793,7 +877,14 @@ class EplbState:
             # expert_load_pass: (num_moe_layers, num_physical_experts)
             expert_load_pass_list = self._sync_load_pass()
             ep_group = get_ep_group().device_group
+            local_tokens = (
+                self._gather_local_tokens(ep_group) if self._dump_step_loads else None
+            )
             if ep_group.rank() == 0:
+                if self._step_dumper is not None and local_tokens is not None:
+                    self._step_dumper.push(
+                        is_dummy, expert_load_pass_list[0], local_tokens
+                    )
                 stats: list[tuple[str, torch.Tensor]] = []
                 for expert_load_pass, eplb_model_state in zip(
                     expert_load_pass_list, self.model_states.values()
@@ -1426,6 +1517,19 @@ class EplbState:
             all_gather_into_tensor(out, tensor.contiguous(), group=ep_group)
             gathered.append(out)
         return gathered
+
+    def _gather_local_tokens(self, ep_group: ProcessGroup) -> torch.Tensor:
+        """All-gather this forward's unpadded token count from every EP rank."""
+        model_state = next(iter(self.model_states.values()))
+        tensors = model_state.num_unpadded_tokens_tensors
+        local = (
+            tensors[0].reshape(1)
+            if tensors is not None
+            else torch.zeros(1, dtype=torch.int32, device=self.device)
+        )
+        out = local.new_empty((ep_group.size(),))
+        all_gather_into_tensor(out, local.contiguous(), group=ep_group)
+        return out
 
     def _sync_load_pass(self) -> list[torch.Tensor]:
         """Sync the expert load pass across all ranks for log stats.

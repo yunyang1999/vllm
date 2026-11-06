@@ -321,6 +321,8 @@ if TYPE_CHECKING:
     EVENMOE_DUMP_LP_SKIP: int = 0
     EVENMOE_TIME_L2: int = 0
     EVENMOE_TIME_REFRESH: int = 0
+    VLLM_EPLB_DUMP_STEP_LOAD_PATH: str | None = None
+    EVENMOE_FORCE_UNIFORM_ROUTING: bool = False
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_MORI_EP_V2: bool | None = None
     VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD: int = 256
@@ -2262,6 +2264,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "EVENMOE_DUMP_LP_SKIP": lambda: int(os.getenv("EVENMOE_DUMP_LP_SKIP", "0")),
     "EVENMOE_TIME_L2": lambda: int(os.getenv("EVENMOE_TIME_L2", "0")),
     "EVENMOE_TIME_REFRESH": lambda: int(os.getenv("EVENMOE_TIME_REFRESH", "0")),
+    # Decode-balance study: on EP rank 0, write every logged step's global
+    # physical expert load plus each rank's token count as .npz chunks under
+    # this directory. Per-step records need eplb_config.log_balancedness with
+    # log_balancedness_interval=1.
+    "VLLM_EPLB_DUMP_STEP_LOAD_PATH": lambda: (
+        os.getenv("VLLM_EPLB_DUMP_STEP_LOAD_PATH") or None
+    ),
+    # Timing floor for the balance study: route every token round-robin so the
+    # expert load is perfectly balanced. Outputs are garbage; timing only.
+    "EVENMOE_FORCE_UNIFORM_ROUTING": lambda: (
+        os.getenv("EVENMOE_FORCE_UNIFORM_ROUTING", "0") == "1"
+    ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput
     # on system supports multi-node nvlink (e.g GB200).
