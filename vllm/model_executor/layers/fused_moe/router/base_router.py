@@ -7,6 +7,9 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.model_executor.layers.fused_moe.balance_study import (
+    maybe_force_uniform_routing,
+)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
@@ -459,6 +462,8 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
+
+        topk_ids = maybe_force_uniform_routing(topk_ids, router_logits.shape[-1])
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
