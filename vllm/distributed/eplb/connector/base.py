@@ -163,11 +163,21 @@ class EplbConnectorBase(ABC):
 
     @classmethod
     def inapplicable_reason(
-        cls, eplb_config: EPLBConfig, num_redundant_experts: int
+        cls,
+        eplb_config: EPLBConfig,
+        num_redundant_experts: int,
+        *,
+        ep_size: int | None = None,
+        num_logical_experts: int | None = None,
     ) -> str | None:
         """Why the configured routing cannot act on this deployment, or
         ``None`` if it can. The framework disables routing and logs the
-        reason; placement is unaffected."""
+        reason; placement is unaffected.
+
+        ``ep_size`` and ``num_logical_experts`` are supplied when the caller
+        knows them (the EP size from the configuration alone, the expert count
+        once the model is known) so a policy with a layout precondition can
+        state it early; a connector ignores what it does not need."""
         return None
 
     @abstractmethod

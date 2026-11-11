@@ -39,7 +39,14 @@ class DummyConnector(EplbConnectorBase):
         return EplbRoutingCapabilities(requires_post_topk_routing=True)
 
     @classmethod
-    def inapplicable_reason(cls, eplb_config, num_redundant_experts):
+    def inapplicable_reason(
+        cls,
+        eplb_config,
+        num_redundant_experts,
+        *,
+        ep_size=None,
+        num_logical_experts=None,
+    ):
         return None if num_redundant_experts else "needs redundant experts"
 
     def bind_routing(self, **kwargs):

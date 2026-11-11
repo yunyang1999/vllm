@@ -1870,6 +1870,9 @@ def l2_inapplicable_reason(
     algorithm: str,
     num_redundant_experts: int,
     routes_shared_expert: bool | None = None,
+    *,
+    ep_size: int | None = None,
+    num_logical_experts: int | None = None,
 ) -> str | None:
     """Why the named policy cannot act on this deployment, or None.
 
@@ -1880,6 +1883,13 @@ def l2_inapplicable_reason(
     VLLM_FUSE_SHARED_EXPERTS off it is a per-rank replicated MLP, so there is
     no rank for a shared-expert policy to choose and the policy says so
     itself.
+
+    ``ep_size`` and ``num_logical_experts`` are passed when the caller knows
+    them, so a policy with a layout precondition (ultraep's rank-local
+    redundancy needs the EP group, the logical experts and the redundant
+    experts to all split evenly across ranks) can state it before the server
+    starts. EvenMoE skips the checks that need a value left at None, so the
+    answer is never wrong for being asked early -- only less complete.
 
     Answered from the env switch rather than from a built layer because this
     runs during configuration validation, before any model exists. A layer
@@ -1908,6 +1918,8 @@ def l2_inapplicable_reason(
             num_redundant_experts=num_redundant_experts,
             routes_shared_expert=routes_shared_expert,
             carries_placement_metadata=True,
+            ep_size=ep_size,
+            num_logical_experts=num_logical_experts,
         )
     )
 

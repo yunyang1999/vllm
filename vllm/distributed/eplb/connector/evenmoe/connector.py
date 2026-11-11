@@ -90,7 +90,12 @@ class EvenMoeConnector(EplbConnectorBase):
 
     @classmethod
     def inapplicable_reason(
-        cls, eplb_config: EPLBConfig, num_redundant_experts: int
+        cls,
+        eplb_config: EPLBConfig,
+        num_redundant_experts: int,
+        *,
+        ep_size: int | None = None,
+        num_logical_experts: int | None = None,
     ) -> str | None:
         # Whether the shared expert is dispatched: the explicit switch, or the
         # pipeline itself asking for it (waterfill picks a rank for it, and
@@ -102,7 +107,11 @@ class EvenMoeConnector(EplbConnectorBase):
             caps is not None and caps.routes_shared_expert
         )
         return l2_inapplicable_reason(
-            eplb_config.l2_algorithm, num_redundant_experts, routes_shared_expert
+            eplb_config.l2_algorithm,
+            num_redundant_experts,
+            routes_shared_expert,
+            ep_size=ep_size,
+            num_logical_experts=num_logical_experts,
         )
 
     # -- the engine's balancer ------------------------------------------------
@@ -174,6 +183,51 @@ class EvenMoeConnector(EplbConnectorBase):
             _reject_graphs_with_rearranging_placement_state(rearranges)
         self.routing = runtime
         return runtime
+
+    def requires_per_source_rank_statistics(self, algorithm: str) -> bool:
+        """Whether the named L1 planner solves from each source rank's counts.
+
+        The planner's own declaration, read through the balancer; it is what
+        ``EplbState.rearrange`` acts on when it chooses between a sum-reducing
+        all-reduce and an all-gather of the load windows.
+        """
+        return self.balancer().requires_per_source_rank_statistics(algorithm)
+
+    def plan_initial_placement(
+        self,
+        algorithm: str,
+        *,
+        num_moe_layers: int,
+        num_logical_experts: int,
+        num_physical_experts: int,
+        num_ranks: int,
+        num_groups: int,
+        num_nodes: int,
+    ):
+        """The named L1 planner's layout before any statistics, or None.
+
+        None means the planner has no layout of its own (every EPLB variant)
+        and vLLM keeps its trivial initial placement. The plan is uncommitted,
+        like :meth:`plan_placement`'s: the caller moves the loaded weights into
+        it and commits the maps. No quota is stashed for the router -- the
+        initial plan publishes none, and the router keeps routing by the
+        committed maps until the first solve does.
+        """
+        from evenmoe import PlacementTopology
+        from evenmoe.adapters.vllm import to_vllm_physical_to_logical
+
+        plan = self.balancer().plan_initial_placement(
+            PlacementTopology(
+                num_physical_experts=num_physical_experts,
+                num_local_physical_experts=num_physical_experts // num_ranks,
+                num_groups=num_groups,
+                num_nodes=num_nodes,
+            ),
+            num_logical_experts=num_logical_experts,
+            num_layers=num_moe_layers,
+            placement_policy=algorithm,
+        )
+        return None if plan is None else to_vllm_physical_to_logical(plan)
 
     def plan_placement(self, request):
         """Run L1 through the engine's balancer and hand back vLLM's one map."""
