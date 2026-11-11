@@ -52,7 +52,14 @@ DEFAULT_ALGORITHM = "auto"
 ALGORITHM_ENV = "VLLM_EVENMOE_L1_ALGORITHM"
 
 
-def _algorithm() -> str:
+def l1_algorithm() -> str:
+    """The L1 planner vLLM runs: ``VLLM_EVENMOE_L1_ALGORITHM``, else ``auto``.
+
+    Public because the L2 side checks the pairing against it: a routing
+    pipeline that works from state its own planner publishes (``ultraep``)
+    names the planner it requires, and only this module knows which one is
+    selected.
+    """
     return envs.VLLM_EVENMOE_L1_ALGORITHM or DEFAULT_ALGORITHM
 
 
@@ -73,7 +80,7 @@ class EvenMoeEplbPolicy(AbstractEplbPolicy):
         )
 
         return current_evenmoe_connector().requires_per_source_rank_statistics(
-            _algorithm()
+            l1_algorithm()
         )
 
     @classmethod
@@ -99,7 +106,7 @@ class EvenMoeEplbPolicy(AbstractEplbPolicy):
         )
 
         phy2log = current_evenmoe_connector().plan_initial_placement(
-            _algorithm(),
+            l1_algorithm(),
             num_moe_layers=num_moe_layers,
             num_logical_experts=num_logical_experts,
             num_physical_experts=num_physical_experts,
@@ -110,7 +117,7 @@ class EvenMoeEplbPolicy(AbstractEplbPolicy):
         if phy2log is None:
             return None
         logger.info_once(
-            "EPLB initial placement delegated to EvenMoE (algorithm=%s)", _algorithm()
+            "EPLB initial placement delegated to EvenMoE (algorithm=%s)", l1_algorithm()
         )
         return phy2log.cpu().to(torch.int64)
 
@@ -138,7 +145,7 @@ class EvenMoeEplbPolicy(AbstractEplbPolicy):
                 "`pip install -e /path/to/evenmoe --no-deps`."
             ) from exc
 
-        algorithm = _algorithm()
+        algorithm = l1_algorithm()
 
         # ultraep's placement kernel derives the cross-rank sum itself from
         # the per-rank breakdown, so hand that over whole instead of the
