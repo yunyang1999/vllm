@@ -71,17 +71,17 @@ class EvenMoeEplbPolicy(AbstractEplbPolicy):
         """Whether the selected planner needs ``[ranks, layers, experts]`` counts.
 
         Asked of the engine's connector, which reads the planner's own
-        declaration (``PlacementPlanner.requires_per_source_rank_statistics``):
-        a name comparison here would have to be kept in step with every planner
-        that makes the same choice, and would miss one spelled differently.
+        declaration (``PlacementPlanner.logical_count``, "global" or
+        "per_source_rank"): a name comparison here would have to be kept in
+        step with every planner that makes the same choice, and would miss one
+        spelled differently.
         """
         from vllm.distributed.eplb.connector.evenmoe.connector import (
             current_evenmoe_connector,
         )
 
-        return current_evenmoe_connector().requires_per_source_rank_statistics(
-            l1_algorithm()
-        )
+        connector = current_evenmoe_connector()
+        return connector.placement_logical_count(l1_algorithm()) == "per_source_rank"
 
     @classmethod
     def initial_placement(
