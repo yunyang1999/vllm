@@ -238,11 +238,6 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         layer_state: EplbLayerState | None = None,
         topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # A pluggable load balancer decides how each logical expert's traffic
-        # should be split across its replicas; it does not need to own the
-        # per-token step. Ask it for that split and keep the fused kernel --
-        # which means load recording, the record gate and the padding mask all
-        # stay exactly as they are, with nothing reimplemented alongside them.
         replica_prob = None
         physical_ids = None
         if layer_state is not None and topk_weights is not None:
@@ -266,7 +261,18 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
                 and _layer_id is not None
                 else None
             )
-            if fixed is not None:
+            if getattr(routing, "fuses_replica_mapping_and_recording", False):
+                assert routing is not None
+                fused_ids = routing.try_fused_replica_mapping(
+                    topk_ids,
+                    layer_state,
+                    expert_load_view,
+                    record_enabled,
+                    num_unpadded_tokens,
+                )
+                if fused_ids is not None:
+                    return fused_ids
+            elif fixed is not None:
                 logical_to_physical_map, logical_replica_count = fixed
             elif routing is not None and routing.requires_post_topk_routing:
                 replica_prob, physical_ids = routing.resolve_routing(

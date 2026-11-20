@@ -4,11 +4,10 @@
 
 vLLM's built-in replica choice is a Knuth hash of the token index, fused into
 the same Triton kernel that records expert load
-(``fused_moe/router/base_router.py``).  When an EvenMoE routing algorithm is
-selected the kernel is kept: EvenMoE supplies the per-expert replica shares it
-solved for, and the kernel samples from them instead of hashing.  Recording,
-the record gate and the padding mask therefore stay where vLLM put them, with
-nothing reimplemented alongside.
+(`fused_moe/router/base_router.py`). Most EvenMoE policies return physical
+expert IDs to this kernel for accounting. A prepared fused router such as
+RLRB can use the same vLLM-owned record gate, padding count and load tensor
+to map and account for a batch in one launch.
 
 Enable with ``VLLM_EVENMOE_L2_ALGORITHM``, e.g. ``lplb``, ``dynamic``, ``static``.
 Unset (the default) leaves vLLM's fused kernel in charge, so this module costs
@@ -296,6 +295,38 @@ class EvenMoeRoutingRuntime:
         self.requires_post_topk_routing = caps.requires_post_topk_routing
         self.requires_placement_state = caps.requires_placement_state
         self.requires_rank_dispatch_map = caps.requires_rank_dispatch_map
+        self.fuses_replica_mapping_and_recording = getattr(
+            caps, "fuses_replica_mapping_and_recording", False
+        )
+        self._fused_replica_policy: str | None = None
+        if self.fuses_replica_mapping_and_recording:
+            from vllm.config import CompilationMode, get_current_vllm_config_or_none
+
+            config = get_current_vllm_config_or_none()
+            parallel = config.parallel_config if config is not None else None
+            if (
+                config is not None
+                and parallel is not None
+                and parallel.tensor_parallel_size == 1
+                and parallel.prefill_context_parallel_size == 1
+                and parallel.decode_context_parallel_size == 1
+                and parallel.all2all_backend
+                in ("flashinfer_nvlink_two_sided", "flashinfer_all2allv")
+                and not parallel.enable_elastic_ep
+                and not parallel.eplb_config.use_async
+                and config.speculative_config is None
+                and config.compilation_config.mode == CompilationMode.NONE
+            ):
+                self._fused_replica_policy = self._evenmoe.routing_pipeline.policies[0]
+            else:
+                self.requires_placement_state = False
+                logger.warning_once(
+                    "EvenMoE %s fused routing requires TP/CP=1, FlashInfer "
+                    "two-sided NVLink, synchronous non-elastic EPLB, no "
+                    "speculative decoding, and compilation mode NONE. "
+                    "Using vLLM replica routing.",
+                    algorithm,
+                )
         # Whether a policy in this pipeline picks the shared expert's rank.
         # The router still has to have somewhere to put that answer -- it only
         # asks when its layer was built with the EP shared-expert layout
@@ -545,7 +576,9 @@ class EvenMoeRoutingRuntime:
         # placement to noise and keeps it there. It bites only where batches
         # are genuinely small: a prefill-shaped step is orders of magnitude
         # above either threshold.
-        self._ultraep_min_representative_tokens = envs.EVENMOE_ULTRAEP_REFRESH_MIN_TOKENS
+        self._ultraep_min_representative_tokens = (
+            envs.EVENMOE_ULTRAEP_REFRESH_MIN_TOKENS
+        )
         # Parsed, not compared as a string. `algorithm` is the whole L2
         # expression, so an equality test here silently misses every
         # composition that merely *contains* ultraep -- `ultraep+waterfill`
@@ -819,6 +852,7 @@ class EvenMoeRoutingRuntime:
         # kernel's gather strides by 1 instead of by the candidate map's padded
         # width of MAX_EXPERT_REDUNDANCY + 1, and reads a table small enough to
         # stay cached.
+        assert self._default_replicas is not None
         fixed_map = (
             self._default_replicas.to(self._logical_to_physical_map.dtype)
             .unsqueeze(-1)
@@ -1025,6 +1059,29 @@ class EvenMoeRoutingRuntime:
             "EvenMoE: refreshed placement state for %d/%d layers",
             len(changed_layer_ids),
             self._logical_to_physical_map.shape[0],
+        )
+
+    def try_fused_replica_mapping(
+        self,
+        topk_ids: torch.Tensor,
+        layer_state: EplbLayerState,
+        expert_load_view: torch.Tensor,
+        record_enabled: torch.Tensor,
+        num_unpadded_tokens: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Map and record a decode batch, or defer to vLLM's native kernel."""
+        layer_id = layer_state.moe_layer_idx
+        if self._fused_replica_policy is None or layer_id is None:
+            return None
+        if _current_stage() != "decode":
+            return None
+        return self._evenmoe.route_prepared_tokens(
+            self._fused_replica_policy,
+            layer_id,
+            topk_ids,
+            token_count=num_unpadded_tokens,
+            expert_load_view=expert_load_view,
+            record_enabled=record_enabled,
         )
 
     def resolve_routing(
@@ -1544,7 +1601,8 @@ class EvenMoeRoutingRuntime:
         )
         if int(verdict.item()) == 0:
             logger.info(
-                "EvenMoE weight sync: %s; using the direct send/recv mover on every rank",
+                "EvenMoE weight sync: %s; using the direct send/recv "
+                "mover on every rank",
                 reason or "another EP rank cannot use symmetric memory",
             )
             self._ultraep_mover = "direct"
