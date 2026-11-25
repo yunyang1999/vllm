@@ -26,6 +26,7 @@ from vllm.distributed.eplb.connector.evenmoe.runtime import (
     EvenMoeRoutingRuntime,
     VllmRoutingCollectives,
     _reject_graphs_with_rearranging_placement_state,
+    _routing_selection,
     l2_inapplicable_reason,
     l2_pipeline_capabilities,
 )
@@ -144,7 +145,7 @@ class EvenMoeConnector(EplbConnectorBase):
                 self._balancer = self._placement_only_balancer()
             else:
                 self._balancer = MoELoadBalancer.from_algorithm(
-                    self.algorithm,
+                    _routing_selection(self.algorithm),
                     placement_policy=self._l1_policy(),
                     **self._balancer_kwargs,
                 )
@@ -185,7 +186,9 @@ class EvenMoeConnector(EplbConnectorBase):
             "collectives": VllmRoutingCollectives(),
         }
         self._balancer = MoELoadBalancer.from_algorithm(
-            self.algorithm, placement_policy=self._l1_policy(), **self._balancer_kwargs
+            _routing_selection(self.algorithm),
+            placement_policy=self._l1_policy(),
+            **self._balancer_kwargs,
         )
         runtime = EvenMoeRoutingRuntime(
             self.algorithm,
