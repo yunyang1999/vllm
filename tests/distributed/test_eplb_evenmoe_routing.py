@@ -23,6 +23,7 @@ from vllm.distributed.eplb.eplb_state import (  # noqa: E402
 )
 from vllm.distributed.eplb.evenmoe_runtime import (  # noqa: E402
     EvenMoeRoutingRuntime,
+    init_evenmoe_routing,
     reset_evenmoe_routing,
 )
 
@@ -88,6 +89,142 @@ def test_every_replica_policy_resolves_ids_rather_than_going_silent():
     # table for this method to apply.
     assert shares is None
     assert ids is not None and ids.shape == logical.shape
+
+
+@pytest.mark.parametrize(("ep_size", "batch_size"), [(16, 128), (32, 256)])
+def test_rlrb_decode_graph_uses_live_placement_and_record_gate(ep_size, batch_size):
+    """A replay routes to the relocated replica and counts only real tokens."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires Blackwell CUDA")
+    from vllm.config import (
+        CompilationConfig,
+        CompilationMode,
+        CUDAGraphMode,
+        EPLBConfig,
+        ParallelConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        _eplb_map_and_record_triton,
+        eplb_map_to_physical_and_record,
+    )
+
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            data_parallel_size=ep_size,
+            enable_expert_parallel=True,
+            enable_eplb=True,
+            all2all_backend="flashinfer_nvlink_two_sided",
+            eplb_config=EPLBConfig(
+                policy="evenmoe",
+                use_async=False,
+                num_redundant_experts=32,
+                l2_algorithm="rlrb",
+            ),
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        ),
+    )
+    # Rank zero receives the three single-copy experts in every token. The
+    # headroom step should move all work for expert zero to its remote replica.
+    placement = torch.tensor([list(range(128)) + [0] + list(range(4, 35))])
+    candidates, counts = compute_logical_maps(placement, 128)
+    placement_gpu, candidates_gpu, counts_gpu = (
+        t.cuda() for t in (placement, candidates, counts)
+    )
+    with set_current_vllm_config(config):
+        routing = init_evenmoe_routing(
+            algorithm=config.parallel_config.eplb_config.l2_algorithm,
+            ep_size=ep_size,
+            ep_rank=0,
+            num_logical_experts=128,
+            num_physical_experts=160,
+            physical_to_logical_map=placement_gpu,
+            logical_to_physical_map=candidates_gpu,
+            logical_replica_count=counts_gpu,
+        )
+        assert routing is not None
+        routing.announce_initial_placement()
+    load = torch.zeros((1, 160), dtype=torch.int64, device="cuda")
+    state = EplbLayerState()
+    state.set_layer_state(0, load, candidates_gpu, counts_gpu)
+    ids = torch.arange(4, device="cuda", dtype=torch.int32).repeat(batch_size, 1)
+    ids[0, 3] = -1
+    weights = torch.full_like(ids, 0.25, dtype=torch.float32)
+    gate = torch.zeros((), dtype=torch.bool, device="cuda")
+    tokens = torch.tensor(batch_size // 2, dtype=torch.int32, device="cuda")
+    dp_counts = torch.full((ep_size,), batch_size, dtype=torch.int32, device="cpu")
+
+    def route():
+        return eplb_map_to_physical_and_record(
+            ids,
+            load[0],
+            candidates_gpu[0],
+            counts_gpu[0],
+            gate,
+            tokens,
+            layer_state=state,
+            topk_weights=weights,
+        )
+
+    with set_forward_context(
+        None,
+        config,
+        num_tokens=batch_size,
+        num_tokens_across_dp=dp_counts,
+        uniform_decode_across_dp=True,
+    ):
+        route()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            physical_ids = route()
+
+    graph.replay()
+    valid_rows = batch_size // 2
+    assert (physical_ids[:valid_rows, 0] == 128).all()
+    assert load.sum().item() == 0
+
+    placement[0, 128], placement[0, 159] = 34, 0
+    candidates, counts = compute_logical_maps(placement, 128)
+    placement_gpu.copy_(placement)
+    candidates_gpu.copy_(candidates)
+    counts_gpu.copy_(counts)
+    routing.on_placement_committed([0])
+    valid_rows //= 2
+    tokens.fill_(valid_rows)
+    gate.fill_(True)
+
+    graph.replay()
+    assert (physical_ids[:valid_rows, 0] == 159).all()
+    valid = ids >= 0
+    torch.testing.assert_close(
+        placement_gpu[0, physical_ids[valid].long()], ids[valid].long()
+    )
+    assert physical_ids[0, 3].item() == -1
+    recorded_ids = physical_ids[:valid_rows].flatten()
+    torch.testing.assert_close(
+        load[0], torch.bincount(recorded_ids[recorded_ids >= 0].long(), minlength=160)
+    )
+
+    gate.zero_()
+    with set_forward_context(
+        None,
+        config,
+        num_tokens=batch_size,
+        num_tokens_across_dp=dp_counts,
+        uniform_decode_across_dp=False,
+    ):
+        native = _eplb_map_and_record_triton(
+            ids, candidates_gpu[0], counts_gpu[0], load[0], gate, tokens
+        )
+        torch.testing.assert_close(route(), native)
 
 
 def test_ultraep_fast_refresh_degrades_gracefully_without_a_mover():

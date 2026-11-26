@@ -314,6 +314,7 @@ Two stages are configurable:
 - **L2, replica routing** (`--eplb-config.l2_algorithm` or `VLLM_EVENMOE_L2_ALGORITHM`): which replica
   of a logical expert serves each token. Expressions combine a routed-expert policy (`static`,
   `lplb`, `ultraep`) with an optional shared-expert policy (`+waterfill`), e.g. `lplb+waterfill`.
+  `rlrb` is a standalone routed-expert policy.
   `waterfill` dispatches the shared expert through the expert-parallel all-to-all so that it can be
   assigned to the least-loaded rank; this widens the expert space by one slot per rank and can be
   enabled on its own with `VLLM_FUSE_SHARED_EXPERTS=1`. L2 routing is skipped automatically when
@@ -355,6 +356,29 @@ vllm serve <target-moe-model> \
   --eplb-config '{"num_redundant_experts":2,"draft_num_redundant_experts":2}' \
   --speculative-config '{"method":"draft_model","model":"<draft-moe-model>","num_speculative_tokens":5}'
 ```
+
+#### Rank-Local Replica Balancing (RLRB)
+
+Install EvenMoE with the `rlrb` policy. For an EP16 MiniMax M3.1 deployment,
+configure the worker group with:
+
+```bash
+vllm serve MiniMaxAI/MiniMax-M3.1-Flash \
+    --tensor-parallel-size 1 --data-parallel-size 16 --max-num-seqs 256 \
+    --enable-expert-parallel --enable-eplb \
+    --all2all-backend flashinfer_nvlink_two_sided --moe-backend flashinfer_cutedsl \
+    --eplb-config '{"policy":"evenmoe","use_async":false,"num_redundant_experts":32,"l2_algorithm":"rlrb"}' \
+    --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","decode_cudagraph_capture_request_sizes":[128,256]}'
+```
+
+Use one source rank per DP rank (TP and context parallel sizes of one), EP16
+or EP32, and a dense layout with 128 routed logical experts and 160 physical
+slots. On GB200/GB300, RLRB uses the current rank's Top-4 counts to choose
+replicas and record EPLB load in one kernel. The fused path accepts contiguous
+int32 Top-4 with 128 or 256 rows in uniform decode without speculative decoding.
+Prefill, mixed batches and other input shapes use vLLM's built-in replica
+mapping. A committed synchronous EPLB update refreshes the placement tables
+in place so existing CUDA graphs can read them on replay.
 
 ### Expert Distribution Formula
 
